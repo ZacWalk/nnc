@@ -1,0 +1,5 @@
+exe/
+intermediate/
+models/
+.vs/
+.vscode/
