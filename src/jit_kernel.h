@@ -35,6 +35,11 @@ using nnc_dot_f16_fn = float (*)(const void* x, const void* y);
 // W is FP16, x and y are FP32. rows and cols are baked.
 using nnc_gemv_f16w_f32x_fn = void (*)(const void* W, const float* x, float* y);
 
+// Specialized fused gemv:
+//   y[r] = sum_k bf16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
+// W is BF16, x and y are FP32. rows and cols are baked.
+using nnc_gemv_bf16w_f32x_fn = void (*)(const void* W, const float* x, float* y);
+
 // ---- Kernel cache ------------------------------------------------------
 
 class jit_kernel_cache
@@ -58,6 +63,10 @@ public:
 	// Returns a JITted fused FP16 W * FP32 x -> FP32 y gemv kernel for the
 	// given (rows, cols). cols must be a positive multiple of 8.
 	nnc_gemv_f16w_f32x_fn get_gemv_f16w_f32x(uint32_t rows, uint32_t cols);
+
+	// Returns a JITted fused BF16 W * FP32 x -> FP32 y gemv kernel for the
+	// given (rows, cols). cols must be a positive multiple of 8.
+	nnc_gemv_bf16w_f32x_fn get_gemv_bf16w_f32x(uint32_t rows, uint32_t cols);
 
 	// For tests / introspection.
 	size_t size() const;

@@ -7,6 +7,7 @@
 #include "jit_ops.h"
 #include "nn_ops.h"
 #include "emitter_x64.h"
+#include "runtime.h"
 
 #include <cmath>
 #include <cstdio>
@@ -405,6 +406,52 @@ namespace
 		return true;
 	}
 
+	bool test_nnc_rmsnorm_f32()
+	{
+		std::mt19937 rng(0xCAFE);
+		std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+		// Cover Gemma E2B/E4B hidden sizes plus a small odd size for the tail.
+		constexpr size_t sizes[] = {1536, 2560, 256, 13};
+		for (const size_t n : sizes)
+		{
+			std::vector<float> x(n), y(n);
+			for (auto& v : x) v = dist(rng);
+
+			nnc_rmsnorm_f32(y.data(), x.data(), n, 1e-6f);
+
+			// Scalar reference.
+			double s2 = 0.0;
+			for (const auto v : x) s2 += static_cast<double>(v) * v;
+			const float scale = static_cast<float>(1.0 / std::sqrt(s2 / static_cast<double>(n) + 1e-6));
+			for (size_t i = 0; i < n; ++i)
+			{
+				const float ref = x[i] * scale;
+				if (!close(y[i], ref, 1e-5f))
+				{
+					std::printf("    rmsnorm n=%zu i=%zu y=%g ref=%g\n", n, i, y[i], ref);
+					return false;
+				}
+			}
+
+			// rms(y) should be ~1.
+			double sy2 = 0.0;
+			for (const auto v : y) sy2 += static_cast<double>(v) * v;
+			const double rms_y = std::sqrt(sy2 / static_cast<double>(n));
+			if (std::fabs(rms_y - 1.0) > 1e-3)
+			{
+				std::printf("    rmsnorm n=%zu rms(y)=%g\n", n, rms_y);
+				return false;
+			}
+
+			// Aliasing.
+			std::vector<float> z = x;
+			nnc_rmsnorm_f32(z.data(), z.data(), n, 1e-6f);
+			for (size_t i = 0; i < n; ++i)
+				if (!close(z[i], y[i], 1e-5f)) return false;
+		}
+		return true;
+	}
+
 	// ---- nn_ops: gemv_f16w_f32x (Stage D — fused mul_mat) -----------------
 
 	bool gemv_f16w_one(const uint32_t rows, const uint32_t cols, std::mt19937& rng)
@@ -468,6 +515,308 @@ namespace
 		if (!gemv_f16w_one(7, 5, rng)) return false;
 		return true;
 	}
+
+	// ---- BF16 -------------------------------------------------------------
+
+	bool test_bf16_round_trip()
+	{
+		// Round-trip a handful of representative values; values with no
+		// fractional bits beyond bit 16 must round-trip exactly.
+		constexpr float exact[] = {0.0f, 1.0f, -1.0f, 2.0f, 0.5f, -0.5f, 1024.0f, -2048.0f};
+		for (const float v : exact)
+		{
+			const float r = nnc_bf16_to_f32(nnc_f32_to_bf16(v));
+			if (r != v) return false;
+		}
+		// Generic values: |relerr| <= 2^-7 (BF16 has 7 mantissa bits + 1 hidden).
+		std::mt19937 rng(0xBF16);
+		std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+		for (int i = 0; i < 1024; ++i)
+		{
+			const float v = d(rng);
+			const float r = nnc_bf16_to_f32(nnc_f32_to_bf16(v));
+			const float err = std::fabs(r - v);
+			const float scale = std::fmax(std::fabs(v), 1.0f);
+			if (err / scale > (1.0f / 128.0f)) return false;
+		}
+		return true;
+	}
+
+	bool test_bf16_to_f32_row()
+	{
+		// Compare AVX2 batched conversion to the scalar reference.
+		std::mt19937 rng(0xBF16ABCD);
+		std::uniform_real_distribution<float> d(-100.0f, 100.0f);
+		constexpr size_t N = 137; // not a multiple of 8 -> exercise tail
+		std::vector<nnc_bf16_t> src(N);
+		for (size_t i = 0; i < N; ++i)
+			src[i] = nnc_f32_to_bf16(d(rng));
+		std::vector<float> got(N), ref(N);
+		nnc_bf16_to_f32_row(src.data(), got.data(), N);
+		for (size_t i = 0; i < N; ++i)
+			ref[i] = nnc_bf16_to_f32(src[i]);
+		for (size_t i = 0; i < N; ++i)
+			if (got[i] != ref[i]) return false;
+		return true;
+	}
+
+	// ---- nn_ops: gemv_bf16w_f32x ------------------------------------------
+
+	bool test_nnc_gemv_bf16w_f32x()
+	{
+		std::mt19937 rng(0xB16E);
+		std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+		struct sh
+		{
+			uint32_t rows, cols;
+		};
+		// E2B/E4B Gemma shapes plus odd small ones for the tail path.
+		const sh shapes[] = {
+			{1, 8}, {7, 5}, {16, 1536},
+			{1536, 1536}, {2048, 1536}, {6144, 1536},
+		};
+		for (const auto s : shapes)
+		{
+			std::vector<nnc_bf16_t> W(static_cast<size_t>(s.rows) * s.cols);
+			std::vector<float> Wf32(W.size());
+			for (size_t i = 0; i < W.size(); ++i)
+			{
+				const float v = d(rng);
+				W[i] = nnc_f32_to_bf16(v);
+				Wf32[i] = nnc_bf16_to_f32(W[i]);
+			}
+			std::vector<float> x(s.cols), y(s.rows), ref(s.rows);
+			for (auto& v : x) v = d(rng);
+
+			nnc_gemv_bf16w_f32x(W.data(), x.data(), y.data(), s.rows, s.cols);
+
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				double acc = 0.0;
+				const float* row = Wf32.data() + static_cast<size_t>(r) * s.cols;
+				for (uint32_t k = 0; k < s.cols; ++k)
+					acc += static_cast<double>(row[k]) * x[k];
+				ref[r] = static_cast<float>(acc);
+			}
+			// FMA reorders rounding vs scalar; allow modest relative error.
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				if (!close(y[r], ref[r], 1e-3f))
+				{
+					std::printf("    gemv_bf16w r=%u y=%g ref=%g (rows=%u cols=%u)\n",
+					            r, y[r], ref[r], s.rows, s.cols);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: gemv_bf16w_argmax_f32x -----------------------------------
+
+	bool test_nnc_gemv_bf16w_argmax_f32x()
+	{
+		std::mt19937 rng(0xA12A);
+		std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+		struct sh { uint32_t rows, cols; };
+		// Cover the fast path (rows%4==0, cols%8==0) plus the fallback.
+		const sh shapes[] = {
+			{4, 32}, {16, 256}, {2048, 256}, {256, 1536}, {7, 5},
+		};
+		for (const auto s : shapes)
+		{
+			std::vector<nnc_bf16_t> W(static_cast<size_t>(s.rows) * s.cols);
+			std::vector<float> Wf32(W.size());
+			for (size_t i = 0; i < W.size(); ++i)
+			{
+				const float v = d(rng);
+				W[i] = nnc_f32_to_bf16(v);
+				Wf32[i] = nnc_bf16_to_f32(W[i]);
+			}
+			std::vector<float> x(s.cols);
+			for (auto& v : x) v = d(rng);
+
+			// Reference: full materialise then linear scan, BF16-accurate.
+			std::vector<float> ref(s.rows);
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				double acc = 0.0;
+				const float* row = Wf32.data() + static_cast<size_t>(r) * s.cols;
+				for (uint32_t k = 0; k < s.cols; ++k)
+					acc += static_cast<double>(row[k]) * x[k];
+				ref[r] = static_cast<float>(acc);
+			}
+			int ref_best = 0;
+			for (uint32_t r = 1; r < s.rows; ++r)
+				if (ref[r] > ref[ref_best]) ref_best = static_cast<int>(r);
+
+			const int got = nnc_gemv_bf16w_argmax_f32x(W.data(), x.data(),
+			                                           s.rows, s.cols);
+			// FMA reorder may flip ties; if got != ref_best require their
+			// values to be within tolerance.
+			if (got != ref_best)
+			{
+				const float diff = std::fabs(ref[got] - ref[ref_best]);
+				const float tol = 1e-3f * std::max(1.0f, std::fabs(ref[ref_best]));
+				if (diff > tol)
+				{
+					std::printf("    argmax got=%d ref=%d ref_v=%g got_v=%g (rows=%u cols=%u)\n",
+					            got, ref_best, ref[ref_best], ref[got],
+					            s.rows, s.cols);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: swiglu ---------------------------------------------------
+
+	bool test_nnc_swiglu_f32()
+	{
+		std::mt19937 rng(0x5167);
+		std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+		constexpr size_t N = 257;
+		std::vector<float> g(N), u(N), y(N);
+		for (size_t i = 0; i < N; ++i)
+		{
+			g[i] = d(rng);
+			u[i] = d(rng);
+		}
+
+		nnc_swiglu_f32(y.data(), g.data(), u.data(), N);
+
+		for (size_t i = 0; i < N; ++i)
+		{
+			const float sig = 1.0f / (1.0f + std::exp(-g[i]));
+			const float ref = g[i] * sig * u[i];
+			if (!close(y[i], ref, 1e-5f)) return false;
+		}
+		// Aliasing: y == gate must work.
+		std::vector<float> z = g;
+		nnc_swiglu_f32(z.data(), z.data(), u.data(), N);
+		for (size_t i = 0; i < N; ++i)
+			if (!close(z[i], y[i], 1e-5f)) return false;
+		return true;
+	}
+
+	// ---- nn_ops: rope -----------------------------------------------------
+
+	bool test_nnc_rope_f32()
+	{
+		// Property check: pos=0 must be the identity.
+		{
+			std::mt19937 rng(0x5051);
+			std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+			constexpr uint32_t H = 8, D = 64, R = 64;
+			std::vector<float> x(H * D), x0(H * D);
+			for (auto& v : x) v = d(rng);
+			x0 = x;
+			nnc_rope_f32(x.data(), H, D, R, 0, 10000.0f);
+			for (size_t i = 0; i < x.size(); ++i)
+				if (!close(x[i], x0[i], 1e-6f)) return false;
+		}
+
+		// Numerical equivalence vs scalar reference.
+		{
+			std::mt19937 rng(0x5052);
+			std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+			constexpr uint32_t H = 4, D = 64, R = 32; // R < D: trailing lanes pass through
+			std::vector<float> x(H * D), ref(H * D);
+			for (auto& v : x) v = d(rng);
+			ref = x;
+
+			constexpr int32_t pos = 17;
+			constexpr float base = 1e6f;
+			nnc_rope_f32(x.data(), H, D, R, pos, base);
+
+			constexpr uint32_t half = R / 2;
+			for (uint32_t h = 0; h < H; ++h)
+			{
+				float* rh = ref.data() + h * D;
+				for (uint32_t i = 0; i < half; ++i)
+				{
+					const float inv = std::pow(base, -static_cast<float>(2 * i) / static_cast<float>(R));
+					const float theta = pos * inv;
+					const float c = std::cos(theta), s = std::sin(theta);
+					const float a = rh[i], b = rh[i + half];
+					rh[i] = c * a - s * b;
+					rh[i + half] = s * a + c * b;
+				}
+			}
+			for (size_t i = 0; i < x.size(); ++i)
+				if (!close(x[i], ref[i], 1e-5f)) return false;
+		}
+
+		// Property: rotation preserves per-pair magnitude.
+		{
+			std::mt19937 rng(0x5053);
+			std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+			constexpr uint32_t H = 2, D = 16, R = 16;
+			std::vector<float> x(H * D), x0(H * D);
+			for (auto& v : x) v = d(rng);
+			x0 = x;
+			nnc_rope_f32(x.data(), H, D, R, 42, 10000.0f);
+			for (uint32_t h = 0; h < H; ++h)
+			{
+				const float* a = x0.data() + h * D;
+				const float* b = x.data() + h * D;
+				constexpr uint32_t half = R / 2;
+				for (uint32_t i = 0; i < half; ++i)
+				{
+					const float m0 = a[i] * a[i] + a[i + half] * a[i + half];
+					const float m1 = b[i] * b[i] + b[i + half] * b[i + half];
+					if (std::fabs(m0 - m1) > 1e-4f * std::fmax(m0, 1e-6f)) return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: softcap --------------------------------------------------
+
+	bool test_nnc_softcap_f32()
+	{
+		constexpr float cap = 30.0f;
+		constexpr float in[] = {0.0f, 1.0f, -1.0f, 5.0f, -5.0f, 30.0f, 100.0f, -100.0f, 1e6f};
+		constexpr size_t N = sizeof(in) / sizeof(in[0]);
+		float out[N];
+		nnc_softcap_f32(out, in, N, cap);
+		for (size_t i = 0; i < N; ++i)
+		{
+			const float ref = std::tanh(in[i] / cap) * cap;
+			if (!close(out[i], ref, 1e-5f)) return false;
+			if (std::fabs(out[i]) > cap + 1e-4f) return false;
+		}
+		// Soft-cap of 0 stays 0.
+		if (out[0] != 0.0f) return false;
+		// Saturates near +/- cap for large inputs.
+		if (out[8] < cap - 1e-3f || out[8] > cap) return false;
+		return true;
+	}
+
+	// ---- nn_ops: embed_row_bf16 ------------------------------------------
+
+	bool test_nnc_embed_row_bf16()
+	{
+		constexpr size_t n_embd = 17;
+		constexpr size_t n_vocab = 5;
+		std::vector<nnc_bf16_t> table(n_vocab * n_embd);
+		std::mt19937 rng(0xE3B0);
+		std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+		for (auto& v : table) v = nnc_f32_to_bf16(d(rng));
+
+		constexpr int tok = 3;
+		constexpr float scale = 1.5f;
+		std::vector<float> y(n_embd);
+		nnc_embed_row_bf16(y.data(), table.data(), tok, n_embd, scale);
+		for (size_t i = 0; i < n_embd; ++i)
+		{
+			const float ref = nnc_bf16_to_f32(table[tok * n_embd + i]) * scale;
+			if (!close(y[i], ref, 1e-6f)) return false;
+		}
+		return true;
+	}
 }
 
 int run_tests()
@@ -484,7 +833,16 @@ int run_tests()
 	report("nnc_dot_f16_to_f32", test_nnc_dot_f16_to_f32());
 	report("nnc_softmax_f32", test_nnc_softmax_f32());
 	report("nnc_layernorm_f32", test_nnc_layernorm_f32());
+	report("nnc_rmsnorm_f32", test_nnc_rmsnorm_f32());
 	report("nnc_gemv_f16w_f32x", test_nnc_gemv_f16w_f32x());
+	report("bf16_round_trip", test_bf16_round_trip());
+	report("bf16_to_f32_row", test_bf16_to_f32_row());
+	report("nnc_gemv_bf16w_f32x", test_nnc_gemv_bf16w_f32x());
+	report("nnc_gemv_bf16w_argmax_f32x", test_nnc_gemv_bf16w_argmax_f32x());
+	report("nnc_swiglu_f32", test_nnc_swiglu_f32());
+	report("nnc_rope_f32", test_nnc_rope_f32());
+	report("nnc_softcap_f32", test_nnc_softcap_f32());
+	report("nnc_embed_row_bf16", test_nnc_embed_row_bf16());
 
 	std::printf("nnc: %d passed, %d failed\n", g_pass, g_fail);
 	return g_fail;

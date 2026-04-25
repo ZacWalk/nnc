@@ -1,735 +1,23 @@
-// nnc — CLI entry point and GPT-2 inference driver.
-// Parses arguments, dispatches to --test mode when requested, otherwise
-// loads a GPT-2 model file, builds the per-token forward graph against the
-// nnc runtime, and samples tokens until n_predict is reached.
+// nnc — CLI entry point and Gemma inference driver.
+// Parses arguments, dispatches to --test and the various --gguf-*/--gemma-*
+// inspection modes, otherwise loads a Gemma GGUF model and runs an
+// interactive chat REPL against the nnc runtime.
 
 #include "runtime.h"
 
+#include "gemma.h"
+#include "gguf.h"
 #include "utils.h"
 
-#include <cassert>
-#include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
-#include <fstream>
-#include <map>
+#include <iostream>
 #include <string>
 #include <vector>
 
-// default hparams (GPT-2 117M)
-struct gpt2_hparams
-{
-	int32_t n_vocab = 50257;
-	int32_t n_ctx = 1024;
-	int32_t n_embd = 768;
-	int32_t n_head = 12;
-	int32_t n_layer = 12;
-	int32_t f16 = 1;
-};
-
-struct gpt2_layer
-{
-	// normalization
-	struct nnc_tensor* ln_1_g;
-	struct nnc_tensor* ln_1_b;
-
-	struct nnc_tensor* ln_2_g;
-	struct nnc_tensor* ln_2_b;
-
-	// attention
-	struct nnc_tensor* c_attn_attn_w;
-	struct nnc_tensor* c_attn_attn_b;
-
-	struct nnc_tensor* c_attn_proj_w;
-	struct nnc_tensor* c_attn_proj_b;
-
-	// mlp
-	struct nnc_tensor* c_mlp_fc_w;
-	struct nnc_tensor* c_mlp_fc_b;
-
-	struct nnc_tensor* c_mlp_proj_w_trans; // transposed for efficiency
-	struct nnc_tensor* c_mlp_proj_b;
-};
-
-struct gpt2_model
-{
-	gpt2_hparams hparams;
-
-	// normalization
-	struct nnc_tensor* ln_f_g;
-	struct nnc_tensor* ln_f_b;
-
-	struct nnc_tensor* wte; // position embedding
-	struct nnc_tensor* wpe; //    token embedding
-
-	std::vector<gpt2_layer> layers;
-
-	// key + value memory
-	struct nnc_tensor* memory_k;
-	struct nnc_tensor* memory_v;
-
-	//
-	struct nnc_context* ctx;
-	std::map<std::string, struct nnc_tensor*> tensors;
-};
-
-// load the model's weights from a file
-bool gpt2_model_load(const std::string& fname, gpt2_model& model, gpt_vocab& vocab)
-{
-	printf("%s: loading model from '%s'\n", __func__, fname.c_str());
-
-	auto fin = std::ifstream(fname, std::ios::binary);
-	if (!fin)
-	{
-		fprintf(stderr, "%s: failed to open '%s'\n", __func__, fname.c_str());
-		return false;
-	}
-
-	// verify magic
-	{
-		uint32_t magic;
-		fin.read((char*)&magic, sizeof(magic));
-		if (magic != 0x67676d6c)
-		{
-			fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", __func__, fname.c_str());
-			return false;
-		}
-	}
-
-	// load hparams
-	{
-		auto& hparams = model.hparams;
-
-		fin.read((char*)&hparams.n_vocab, sizeof(hparams.n_vocab));
-		fin.read((char*)&hparams.n_ctx, sizeof(hparams.n_ctx));
-		fin.read((char*)&hparams.n_embd, sizeof(hparams.n_embd));
-		fin.read((char*)&hparams.n_head, sizeof(hparams.n_head));
-		fin.read((char*)&hparams.n_layer, sizeof(hparams.n_layer));
-		fin.read((char*)&hparams.f16, sizeof(hparams.f16));
-
-		printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
-		printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
-		printf("%s: n_embd  = %d\n", __func__, hparams.n_embd);
-		printf("%s: n_head  = %d\n", __func__, hparams.n_head);
-		printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
-		printf("%s: f16     = %d\n", __func__, hparams.f16);
-	}
-
-	// load vocab
-	{
-		int32_t n_vocab = 0;
-		fin.read((char*)&n_vocab, sizeof(n_vocab));
-
-		if (n_vocab != model.hparams.n_vocab)
-		{
-			fprintf(stderr, "%s: invalid model file '%s' (bad vocab size %d != %d)\n",
-			        __func__, fname.c_str(), n_vocab, model.hparams.n_vocab);
-			return false;
-		}
-
-		std::string word;
-		for (int i = 0; i < n_vocab; i++)
-		{
-			uint32_t len;
-			fin.read((char*)&len, sizeof(len));
-
-			word.resize(len);
-			fin.read(word.data(), len);
-
-			vocab.token_to_id[word] = i;
-			vocab.id_to_token[i] = word;
-		}
-	}
-
-	// for the big tensors, we have the option to store the data in 16-bit floats or quantized
-	// in order to save memory and also to speed up the computation
-	nnc_type wtype = NNC_TYPE_COUNT;
-	switch (model.hparams.f16)
-	{
-	case 0: wtype = NNC_TYPE_F32;
-		break;
-	case 1: wtype = NNC_TYPE_F16;
-		break;
-	case 2: wtype = NNC_TYPE_Q4_0;
-		break;
-	case 3: wtype = NNC_TYPE_Q4_1;
-		break;
-	default:
-		{
-			fprintf(stderr, "%s: invalid model file '%s' (bad f16 value %d)\n",
-			        __func__, fname.c_str(), model.hparams.f16);
-			return false;
-		}
-	}
-
-	auto& ctx = model.ctx;
-
-	size_t ctx_size = 0;
-
-	{
-		const auto& hparams = model.hparams;
-
-		const int n_embd = hparams.n_embd;
-		const int n_layer = hparams.n_layer;
-		const int n_ctx = hparams.n_ctx;
-		const int n_vocab = hparams.n_vocab;
-
-		ctx_size += n_embd * nnc_type_sizef(NNC_TYPE_F32); // ln_f_g
-		ctx_size += n_embd * nnc_type_sizef(NNC_TYPE_F32); // ln_f_b
-
-		ctx_size += n_vocab * n_embd * nnc_type_sizef(wtype); // wte
-		ctx_size += n_ctx * n_embd * nnc_type_sizef(NNC_TYPE_F32); // wpe
-
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // ln_1_g
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // ln_1_b
-
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // ln_2_g
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // ln_2_b
-
-		ctx_size += n_layer * (3 * n_embd * n_embd * nnc_type_sizef(wtype)); // c_attn_attn_w
-		ctx_size += n_layer * (3 * n_embd * nnc_type_sizef(NNC_TYPE_F32)); // c_attn_attn_b
-
-		ctx_size += n_layer * (n_embd * n_embd * nnc_type_sizef(wtype)); // c_attn_proj_w
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // c_attn_proj_b
-
-		ctx_size += n_layer * (4 * n_embd * n_embd * nnc_type_sizef(wtype)); // c_mlp_fc_w
-		ctx_size += n_layer * (4 * n_embd * nnc_type_sizef(NNC_TYPE_F32)); // c_mlp_fc_b
-
-		ctx_size += n_layer * (4 * n_embd * n_embd * nnc_type_sizef(wtype)); // c_mlp_proj_w
-		ctx_size += n_layer * (n_embd * nnc_type_sizef(NNC_TYPE_F32)); // c_mlp_proj_b
-
-		ctx_size += n_ctx * n_layer * n_embd * nnc_type_sizef(NNC_TYPE_F32); // memory_k
-		ctx_size += n_ctx * n_layer * n_embd * nnc_type_sizef(NNC_TYPE_F32); // memory_v
-
-		ctx_size += (6 + 12 * n_layer) * 256; // object overhead
-
-		printf("%s: ctx size = %6.2f MB\n", __func__, ctx_size / (1024.0 * 1024.0));
-	}
-
-	// create the context
-	{
-		struct nnc_init_params params = {
-			.mem_size = ctx_size,
-			.mem_buffer = nullptr,
-		};
-
-		model.ctx = nnc_init(params);
-		if (!model.ctx)
-		{
-			fprintf(stderr, "%s: nnc_init() failed\n", __func__);
-			return false;
-		}
-	}
-
-	// prepare memory for the weights
-	{
-		const auto& hparams = model.hparams;
-
-		const int n_embd = hparams.n_embd;
-		const int n_layer = hparams.n_layer;
-		const int n_ctx = hparams.n_ctx;
-		const int n_vocab = hparams.n_vocab;
-
-		model.layers.resize(n_layer);
-
-		model.ln_f_g = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-		model.ln_f_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-
-		model.wte = nnc_new_tensor_2d(ctx, wtype, n_embd, n_vocab);
-		model.wpe = nnc_new_tensor_2d(ctx, NNC_TYPE_F32, n_embd, n_ctx);
-
-		// map by name
-		model.tensors["model/ln_f/g"] = model.ln_f_g;
-		model.tensors["model/ln_f/b"] = model.ln_f_b;
-
-		model.tensors["model/wte"] = model.wte;
-		model.tensors["model/wpe"] = model.wpe;
-
-		for (int i = 0; i < n_layer; ++i)
-		{
-			auto& layer = model.layers[i];
-
-			layer.ln_1_g = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-			layer.ln_1_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-
-			layer.ln_2_g = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-			layer.ln_2_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-
-			layer.c_attn_attn_w = nnc_new_tensor_2d(ctx, wtype, n_embd, 3 * n_embd);
-			layer.c_attn_attn_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, 3 * n_embd);
-
-			layer.c_attn_proj_w = nnc_new_tensor_2d(ctx, wtype, n_embd, n_embd);
-			layer.c_attn_proj_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-
-			layer.c_mlp_fc_w = nnc_new_tensor_2d(ctx, wtype, n_embd, 4 * n_embd);
-			layer.c_mlp_fc_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, 4 * n_embd);
-
-			layer.c_mlp_proj_w_trans = nnc_new_tensor_2d(ctx, wtype, 4 * n_embd, n_embd);
-			layer.c_mlp_proj_b = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_embd);
-
-			// map by name
-			model.tensors["model/h" + std::to_string(i) + "/ln_1/g"] = layer.ln_1_g;
-			model.tensors["model/h" + std::to_string(i) + "/ln_1/b"] = layer.ln_1_b;
-
-			model.tensors["model/h" + std::to_string(i) + "/ln_2/g"] = layer.ln_2_g;
-			model.tensors["model/h" + std::to_string(i) + "/ln_2/b"] = layer.ln_2_b;
-
-			model.tensors["model/h" + std::to_string(i) + "/attn/c_attn/w"] = layer.c_attn_attn_w;
-			model.tensors["model/h" + std::to_string(i) + "/attn/c_attn/b"] = layer.c_attn_attn_b;
-
-			model.tensors["model/h" + std::to_string(i) + "/attn/c_proj/w"] = layer.c_attn_proj_w;
-			model.tensors["model/h" + std::to_string(i) + "/attn/c_proj/b"] = layer.c_attn_proj_b;
-
-			model.tensors["model/h" + std::to_string(i) + "/mlp/c_fc/w"] = layer.c_mlp_fc_w;
-			model.tensors["model/h" + std::to_string(i) + "/mlp/c_fc/b"] = layer.c_mlp_fc_b;
-
-			model.tensors["model/h" + std::to_string(i) + "/mlp/c_proj/w"] = layer.c_mlp_proj_w_trans;
-			model.tensors["model/h" + std::to_string(i) + "/mlp/c_proj/b"] = layer.c_mlp_proj_b;
-		}
-	}
-
-	// key + value memory
-	{
-		const auto& hparams = model.hparams;
-
-		const int n_embd = hparams.n_embd;
-		const int n_layer = hparams.n_layer;
-		const int n_ctx = hparams.n_ctx;
-
-		const int n_mem = n_layer * n_ctx;
-		const int n_elements = n_embd * n_mem;
-
-		model.memory_k = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_elements);
-		model.memory_v = nnc_new_tensor_1d(ctx, NNC_TYPE_F32, n_elements);
-
-		const size_t memory_size = nnc_nbytes(model.memory_k) + nnc_nbytes(model.memory_v);
-
-		printf("%s: memory size = %8.2f MB, n_mem = %d\n", __func__, memory_size / 1024.0 / 1024.0, n_mem);
-	}
-
-	// load weights
-	{
-		size_t total_size = 0;
-
-		while (true)
-		{
-			int32_t n_dims;
-			int32_t length;
-			int32_t ftype;
-
-			fin.read(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
-			fin.read(reinterpret_cast<char*>(&length), sizeof(length));
-			fin.read(reinterpret_cast<char*>(&ftype), sizeof(ftype));
-
-			if (fin.eof())
-			{
-				break;
-			}
-
-			int32_t nelements = 1;
-			int32_t ne[2] = {1, 1};
-			for (int i = 0; i < n_dims; ++i)
-			{
-				fin.read(reinterpret_cast<char*>(&ne[i]), sizeof(ne[i]));
-				nelements *= ne[i];
-			}
-
-			std::string name(length, 0);
-			fin.read(&name[0], length);
-
-			if (!model.tensors.contains(name.data()))
-			{
-				fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
-				return false;
-			}
-
-			auto tensor = model.tensors[name.data()];
-			if (nnc_nelements(tensor) != nelements)
-			{
-				fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
-				return false;
-			}
-
-			if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1])
-			{
-				fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%d, %d], expected [%d, %d]\n",
-				        __func__, name.data(), tensor->ne[0], tensor->ne[1], ne[0], ne[1]);
-				return false;
-			}
-
-			if constexpr (false)
-			{
-				static const char* ftype_str[] = {"f32", "f16", "q4_0", "q4_1",};
-				printf("%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), ne[0], ne[1],
-				       ftype_str[ftype], nnc_nbytes(tensor) / 1024.0 / 1024.0, nnc_nbytes(tensor));
-			}
-
-			size_t bpe = 0;
-
-			switch (ftype)
-			{
-			case 0: bpe = nnc_type_size(NNC_TYPE_F32);
-				break;
-			case 1: bpe = nnc_type_size(NNC_TYPE_F16);
-				break;
-			case 2: bpe = nnc_type_size(NNC_TYPE_Q4_0);
-				assert(ne[0] % 64 == 0);
-				break;
-			case 3: bpe = nnc_type_size(NNC_TYPE_Q4_1);
-				assert(ne[0] % 64 == 0);
-				break;
-			default:
-				{
-					fprintf(stderr, "%s: unknown ftype %d in model file\n", __func__, ftype);
-					return false;
-				}
-			}
-
-			if ((nelements * bpe) / nnc_blck_size(tensor->type) != nnc_nbytes(tensor))
-			{
-				fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %zu, expected %zu\n",
-				        __func__, name.data(), nnc_nbytes(tensor), nelements * bpe);
-				return false;
-			}
-
-			fin.read(reinterpret_cast<char*>(tensor->data), nnc_nbytes(tensor));
-
-			total_size += nnc_nbytes(tensor);
-		}
-
-		printf("%s: model size  = %8.2f MB\n", __func__, total_size / 1024.0 / 1024.0);
-	}
-
-	fin.close();
-
-	return true;
-}
-
-// evaluate the transformer
-//
-//   - model:     the model
-//   - n_past:    the context size so far
-//   - embd_inp:  the embeddings of the tokens in the context
-//   - embd_w:    the predicted logits for the next token
-//
-bool gpt2_eval(
-	const gpt2_model& model,
-	const int n_past,
-	const std::vector<gpt_vocab::id>& embd_inp,
-	std::vector<float>& embd_w,
-	size_t& mem_per_token)
-{
-	const int N = embd_inp.size();
-
-	const auto& hparams = model.hparams;
-
-	const int n_embd = hparams.n_embd;
-	const int n_layer = hparams.n_layer;
-	const int n_ctx = hparams.n_ctx;
-	const int n_head = hparams.n_head;
-	const int n_vocab = hparams.n_vocab;
-
-	static size_t buf_size = 256u * 1024 * 1024;
-	static void* buf = malloc(buf_size);
-
-	if (mem_per_token > 0 && mem_per_token * N > buf_size)
-	{
-		const size_t buf_size_new = 1.1 * (mem_per_token * N); // add 10% to account for object overhead
-		//printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
-
-		// reallocate
-		buf_size = buf_size_new;
-		buf = realloc(buf, buf_size);
-		if (buf == nullptr)
-		{
-			fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, buf_size);
-			return false;
-		}
-	}
-
-	const struct nnc_init_params params = {
-		.mem_size = buf_size,
-		.mem_buffer = buf,
-	};
-
-	struct nnc_context* ctx0 = nnc_init(params);
-	struct nnc_cgraph gf = {};
-
-	struct nnc_tensor* embd = nnc_new_tensor_1d(ctx0, NNC_TYPE_I32, N);
-	memcpy(embd->data, embd_inp.data(), N * nnc_element_size(embd));
-
-	struct nnc_tensor* position = nnc_new_tensor_1d(ctx0, NNC_TYPE_I32, N);
-	for (int i = 0; i < N; ++i)
-	{
-		static_cast<int32_t*>(position->data)[i] = n_past + i;
-	}
-
-	// wte + wpe
-	struct nnc_tensor* inpL =
-		nnc_add(ctx0,
-		        nnc_get_rows(ctx0, model.wte, embd),
-		        nnc_get_rows(ctx0, model.wpe, position));
-
-	for (int il = 0; il < n_layer; ++il)
-	{
-		struct nnc_tensor* cur;
-
-		// norm
-		{
-			// [ 768, N]
-			cur = nnc_norm(ctx0, inpL);
-
-			// cur = ln_1_g*cur + ln_1_b
-			// [ 768, N]
-			cur = nnc_add(ctx0,
-			              nnc_mul(ctx0,
-			                      nnc_repeat(ctx0, model.layers[il].ln_1_g, cur),
-			                      cur),
-			              nnc_repeat(ctx0, model.layers[il].ln_1_b, cur));
-		}
-
-		// attn
-		// [2304, 768] - model.layers[il].c_attn_attn_w
-		// [2304,   1] - model.layers[il].c_attn_attn_b
-		// [ 768,   N] - cur (in)
-		// [2304,   N] - cur (out)
-		//
-		// cur = attn_w*cur + attn_b
-		// [2304, N]
-		{
-			cur = nnc_mul_mat(ctx0,
-			                  model.layers[il].c_attn_attn_w,
-			                  cur);
-
-			cur = nnc_add(ctx0,
-			              nnc_repeat(ctx0, model.layers[il].c_attn_attn_b, cur),
-			              cur);
-		}
-
-		// self-attention
-		{
-			struct nnc_tensor* Qcur = nnc_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 0 * sizeof(float) * n_embd);
-			struct nnc_tensor* Kcur = nnc_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 1 * sizeof(float) * n_embd);
-			struct nnc_tensor* Vcur = nnc_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 2 * sizeof(float) * n_embd);
-
-			// store key and value to memory
-			if (N >= 1)
-			{
-				struct nnc_tensor* k = nnc_view_1d(ctx0, model.memory_k, N * n_embd,
-				                                   (nnc_element_size(model.memory_k) * n_embd) * (il * n_ctx +
-					                                   n_past));
-				struct nnc_tensor* v = nnc_view_1d(ctx0, model.memory_v, N * n_embd,
-				                                   (nnc_element_size(model.memory_v) * n_embd) * (il * n_ctx +
-					                                   n_past));
-
-				nnc_build_forward_expand(&gf, nnc_cpy(ctx0, Kcur, k));
-				nnc_build_forward_expand(&gf, nnc_cpy(ctx0, Vcur, v));
-			}
-
-			// Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-			// [64, N, 12]
-			struct nnc_tensor* Q =
-				nnc_permute(ctx0,
-				            nnc_cpy(ctx0,
-				                    Qcur,
-				                    nnc_new_tensor_3d(ctx0, NNC_TYPE_F32, n_embd / n_head, n_head, N)),
-				            0, 2, 1, 3);
-
-			// K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
-			// [64, n_past + N, 12]
-			struct nnc_tensor* K =
-				nnc_permute(ctx0,
-				            nnc_reshape_3d(ctx0,
-				                           nnc_view_1d(ctx0, model.memory_k, (n_past + N) * n_embd,
-				                                       il * n_ctx * nnc_element_size(model.memory_k) * n_embd),
-				                           n_embd / n_head, n_head, n_past + N),
-				            0, 2, 1, 3);
-
-			// GG: flash attention
-			//struct nnc_tensor * V =
-			//    nnc_cpy(ctx0,
-			//            nnc_permute(ctx0,
-			//                nnc_reshape_3d(ctx0,
-			//                    nnc_view_1d(ctx0, model.memory_v, (n_past + N)*n_embd, il*n_ctx*nnc_element_size(model.memory_v)*n_embd),
-			//                    n_embd/n_head, n_head, n_past + N),
-			//                1, 2, 0, 3),
-			//            nnc_new_tensor_3d(ctx0, NNC_TYPE_F32, n_past + N, n_embd/n_head, n_head));
-
-			//struct nnc_tensor * KQV = nnc_flash_attn(ctx0, Q, K, V, true);
-
-			// K * Q
-			// [n_past + N, N, 12]
-			struct nnc_tensor* KQ = nnc_mul_mat(ctx0, K, Q);
-
-			// KQ_scaled = KQ / sqrt(n_embd/n_head)
-			// [n_past + N, N, 12]
-			struct nnc_tensor* KQ_scaled =
-				nnc_scale(ctx0,
-				          KQ,
-				          nnc_new_f32(ctx0, 1.0f / sqrt(static_cast<float>(n_embd) / n_head))
-				);
-
-			// KQ_masked = mask_past(KQ_scaled)
-			// [n_past + N, N, 12]
-			struct nnc_tensor* KQ_masked = nnc_diag_mask_inf(ctx0, KQ_scaled, n_past);
-
-			// KQ = soft_max(KQ_masked)
-			// [n_past + N, N, 12]
-			struct nnc_tensor* KQ_soft_max = nnc_soft_max(ctx0, KQ_masked);
-
-			// V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-			// [n_past + N, 64, 12]
-			struct nnc_tensor* V_trans =
-				nnc_permute(ctx0,
-				            nnc_reshape_3d(ctx0,
-				                           nnc_view_1d(ctx0, model.memory_v, (n_past + N) * n_embd,
-				                                       il * n_ctx * nnc_element_size(model.memory_v) * n_embd),
-				                           n_embd / n_head, n_head, n_past + N),
-				            1, 2, 0, 3);
-
-			// KQV = transpose(V) * KQ_soft_max
-			// [64, N, 12]
-			struct nnc_tensor* KQV = nnc_mul_mat(ctx0, V_trans, KQ_soft_max);
-
-			// KQV_merged = KQV.permute(0, 2, 1, 3)
-			// [64, 12, N]
-			struct nnc_tensor* KQV_merged = nnc_permute(ctx0, KQV, 0, 2, 1, 3);
-
-			// cur = KQV_merged.contiguous().view(n_embd, N)
-			// [768, N]
-			cur = nnc_cpy(ctx0,
-			              KQV_merged,
-			              nnc_new_tensor_2d(ctx0, NNC_TYPE_F32, n_embd, N));
-		}
-
-		// projection
-		// [ 768, 768] - model.layers[il].c_attn_proj_w
-		// [ 768,   1] - model.layers[il].c_attn_proj_b
-		// [ 768,   N] - cur (in)
-		// [ 768,   N] - cur (out)
-		//
-		// cur = proj_w*cur + proj_b
-		// [768, N]
-		{
-			cur = nnc_mul_mat(ctx0,
-			                  model.layers[il].c_attn_proj_w,
-			                  cur);
-
-			cur = nnc_add(ctx0,
-			              nnc_repeat(ctx0, model.layers[il].c_attn_proj_b, cur),
-			              cur);
-		}
-
-		// add the input
-		cur = nnc_add(ctx0, cur, inpL);
-
-		struct nnc_tensor* inpFF = cur;
-
-		// feed-forward network
-		{
-			// norm
-			{
-				cur = nnc_norm(ctx0, inpFF);
-
-				// cur = ln_2_g*cur + ln_2_b
-				// [ 768, N]
-				cur = nnc_add(ctx0,
-				              nnc_mul(ctx0,
-				                      nnc_repeat(ctx0, model.layers[il].ln_2_g, cur),
-				                      cur),
-				              nnc_repeat(ctx0, model.layers[il].ln_2_b, cur));
-			}
-
-			// fully connected
-			// [3072, 768] - model.layers[il].c_mlp_fc_w
-			// [3072,   1] - model.layers[il].c_mlp_fc_b
-			// [ 768,   N] - cur (in)
-			// [3072,   N] - cur (out)
-			//
-			// cur = fc_w*cur + fc_b
-			// [3072, N]
-			cur = nnc_mul_mat(ctx0,
-			                  model.layers[il].c_mlp_fc_w,
-			                  cur);
-
-			cur = nnc_add(ctx0,
-			              nnc_repeat(ctx0, model.layers[il].c_mlp_fc_b, cur),
-			              cur);
-
-			// GELU activation
-			// [3072, N]
-			cur = nnc_gelu(ctx0, cur);
-
-			// projection
-			// [ 768, 3072] - model.layers[il].c_mlp_proj_w
-			// [ 768,    1] - model.layers[il].c_mlp_proj_b
-			// [3072,    N] - cur (in)
-			// [ 768,    N] - cur (out)
-			//
-			// cur = proj_w*cur + proj_b
-			// [768, N]
-			cur = nnc_mul_mat(ctx0,
-			                  model.layers[il].c_mlp_proj_w_trans,
-			                  cur);
-
-			cur = nnc_add(ctx0,
-			              nnc_repeat(ctx0, model.layers[il].c_mlp_proj_b, cur),
-			              cur);
-		}
-
-		// input for next layer
-		inpL = nnc_add(ctx0, cur, inpFF);
-	}
-
-	// norm
-	{
-		// [ 768, N]
-		inpL = nnc_norm(ctx0, inpL);
-
-		// inpL = ln_f_g*inpL + ln_f_b
-		// [ 768, N]
-		inpL = nnc_add(ctx0,
-		               nnc_mul(ctx0,
-		                       nnc_repeat(ctx0, model.ln_f_g, inpL),
-		                       inpL),
-		               nnc_repeat(ctx0, model.ln_f_b, inpL));
-	}
-
-	// inpL = WTE * inpL
-	// [ 768, 50257] - model.wte
-	// [ 768, N]     - inpL
-	inpL = nnc_mul_mat(ctx0, model.wte, inpL);
-
-	// logits -> probs
-	//inpL = nnc_soft_max(ctx0, inpL);
-
-	// run the computation
-	nnc_build_forward_expand(&gf, inpL);
-	nnc_graph_compute(ctx0, &gf);
-
-	//if (n_past%100 == 0) {
-	//    nnc_graph_print   (&gf);
-	//    nnc_graph_dump_dot(&gf, NULL, "gpt-2.dot");
-	//}
-
-	//embd_w.resize(n_vocab*N);
-	//memcpy(embd_w.data(), nnc_get_data(inpL), sizeof(float)*n_vocab*N);
-
-	// return result just for the last token
-	embd_w.resize(n_vocab);
-	memcpy(embd_w.data(), static_cast<float*>(nnc_get_data(inpL)) + (n_vocab * (N - 1)), sizeof(float) * n_vocab);
-
-	if (mem_per_token == 0)
-	{
-		mem_per_token = nnc_used_mem(ctx0) / N;
-	}
-	//printf("used_mem = %zu\n", nnc_used_mem(ctx0));
-
-	nnc_free(ctx0);
-
-	return true;
-}
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 int run_tests(); // tests.cpp
 
@@ -741,6 +29,10 @@ int main(int argc, char** argv)
 	_set_error_mode(_OUT_TO_STDERR);
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
+	// Force UTF-8 on the Windows console so tokens containing U+2581 (▁),
+	// em-dashes, etc. render correctly instead of as cp437 mojibake.
+	SetConsoleOutputCP(CP_UTF8);
+	SetConsoleCP(CP_UTF8);
 	// nnc --test / -test / /test : run all tests and exit.
 	for (int i = 1; i < argc; i++)
 	{
@@ -751,11 +43,234 @@ int main(int argc, char** argv)
 		}
 	}
 
+	// nnc --gguf-info <file> : parse a GGUF file's header + metadata +
+	// tensor table and print them. No inference, no tensor data read.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gguf-info") == 0 || strcmp(a, "-gguf-info") == 0)
+		{
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "error: --gguf-info requires a file path\n");
+				return 1;
+			}
+			gguf_file f{};
+			if (!gguf_load(argv[i + 1], f))
+				return 1;
+			gguf_print_info(f);
+			return 0;
+		}
+	}
+
+	// nnc --gguf-stats <file> [name-substring] : mmap a GGUF file and
+	// print min/max/mean and the first few values for each tensor whose
+	// name contains the substring (default: every tensor). Verifies the
+	// loader can decode F32/F16/BF16 weights end-to-end.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gguf-stats") == 0 || strcmp(a, "-gguf-stats") == 0)
+		{
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "error: --gguf-stats requires a file path\n");
+				return 1;
+			}
+			const char* path = argv[i + 1];
+			const char* needle = (i + 2 < argc) ? argv[i + 2] : "";
+			extern int gguf_stats_main(const char* path, const char* needle);
+			return gguf_stats_main(path, needle);
+		}
+	}
+
+	// nnc --gemma-info <file> : load a Gemma 3n GGUF, parse its hparams
+	// and tokenizer, build nnc_tensor descriptors for every weight, and
+	// report which tensors were found. No inference yet.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-info") == 0 || strcmp(a, "-gemma-info") == 0)
+		{
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-info requires a file path\n");
+				return 1;
+			}
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+			gemma_print_info(gf);
+			gemma_free(gf);
+			return 0;
+		}
+	}
+
+	// nnc --gemma-probe <file> [token_id] : run a partial forward pass
+	// (embed -> attn_norm -> Q proj -> q_norm -> RoPE) on layer 0 of
+	// a Gemma 3n model and print activation statistics. Smoke test for
+	// the BF16 weights + kernels against real model data.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-probe") == 0 || strcmp(a, "-gemma-probe") == 0)
+		{
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-probe requires a file path\n");
+				return 1;
+			}
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+			const int tok = (i + 2 < argc) ? atoi(argv[i + 2]) : gf.bos_id;
+			const int rc = gemma_probe(gf, tok);
+			gemma_free(gf);
+			return rc;
+		}
+	}
+
+	// nnc --gemma-forward <file> [token_id] : run the full single-token
+	// forward pass through every layer (attention is degenerate at
+	// pos=0) and print the top-5 next-token logits. End-to-end pipeline
+	// smoke test against real Gemma weights.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-forward") == 0 || strcmp(a, "-gemma-forward") == 0)
+		{
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-forward requires a file path\n");
+				return 1;
+			}
+			nnc_time_init();
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+			const int tok = (i + 2 < argc) ? atoi(argv[i + 2]) : gf.bos_id;
+			const int rc = gemma_forward_one(gf, tok);
+			gemma_free(gf);
+			return rc;
+		}
+	}
+
+	// nnc --gemma-gen <file> "id1 id2 id3 ..." [n_predict] [n_ctx]
+	// : greedy generation. Token ids are space-separated decimal ints
+	// (until we have a tokenizer). n_predict defaults to 16, n_ctx to
+	// max(256, prompt+n_predict).
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-gen") == 0 || strcmp(a, "-gemma-gen") == 0)
+		{
+			if (i + 2 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-gen requires <file> \"id1 id2 ...\" [n_predict] [n_ctx]\n");
+				return 1;
+			}
+			nnc_time_init();
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+
+			std::vector<int> prompt;
+			{
+				const char* s = argv[i + 2];
+				char buf[32];
+				size_t bp = 0;
+				auto flush = [&]()
+				{
+					if (bp == 0) return;
+					buf[bp] = 0;
+					prompt.push_back(atoi(buf));
+					bp = 0;
+				};
+				for (const char* p = s; *p; ++p)
+				{
+					if (*p == ' ' || *p == ',' || *p == '\t') flush();
+					else if (bp + 1 < sizeof(buf)) buf[bp++] = *p;
+				}
+				flush();
+			}
+			if (prompt.empty()) prompt.push_back(gf.bos_id);
+
+			const int n_predict = (i + 3 < argc) ? atoi(argv[i + 3]) : 16;
+			int n_ctx = (i + 4 < argc) ? atoi(argv[i + 4]) : 0;
+			if (n_ctx <= 0)
+			{
+				const int needed = static_cast<int>(prompt.size()) + n_predict;
+				n_ctx = needed > 256 ? needed : 256;
+			}
+			const int rc = gemma_generate(gf, prompt, n_predict, n_ctx);
+			gemma_free(gf);
+			return rc;
+		}
+	}
+
+	// nnc --gemma-tokenize <file> "text..." : run BPE on the prompt and
+	// print the resulting token id / piece string list. Quick smoke test
+	// for the tokenizer without spinning up the model forward pass.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-tokenize") == 0 || strcmp(a, "-gemma-tokenize") == 0)
+		{
+			if (i + 2 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-tokenize requires <file> \"text\"\n");
+				return 1;
+			}
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+			const std::vector<int> toks = gemma_tokenize(gf, argv[i + 2], gf.add_bos_token);
+			printf("input    : %s\n", argv[i + 2]);
+			printf("tokens   : %zu\n", toks.size());
+			for (size_t k = 0; k < toks.size(); ++k)
+			{
+				const int t = toks[k];
+				const char* s = (t >= 0 && t < static_cast<int>(gf.vocab_tokens.size()))
+					                ? gf.vocab_tokens[t].c_str()
+					                : "?";
+				printf("  [%3zu] id=%-7d '%s'\n", k, t, s);
+			}
+			const std::string round = gemma_detokenize(gf, toks);
+			printf("detok    : %s\n", round.c_str());
+			gemma_free(gf);
+			return 0;
+		}
+	}
+
+	// nnc --gemma-prompt <file> "text" [n_predict] [n_ctx]
+	// : tokenize prompt, prefill, greedy-decode n_predict tokens.
+	for (int i = 1; i < argc; i++)
+	{
+		const char* a = argv[i];
+		if (strcmp(a, "--gemma-prompt") == 0 || strcmp(a, "-gemma-prompt") == 0)
+		{
+			if (i + 2 >= argc)
+			{
+				fprintf(stderr, "error: --gemma-prompt requires <file> \"text\" [n_predict] [n_ctx]\n");
+				return 1;
+			}
+			nnc_time_init();
+			gemma_file gf{};
+			if (!gemma_load(argv[i + 1], gf)) return 1;
+			const std::vector<int> prompt = gemma_tokenize(gf, argv[i + 2], gf.add_bos_token);
+			const int n_predict = (i + 3 < argc) ? atoi(argv[i + 3]) : 16;
+			int n_ctx = (i + 4 < argc) ? atoi(argv[i + 4]) : 0;
+			if (n_ctx <= 0)
+			{
+				const int needed = static_cast<int>(prompt.size()) + n_predict;
+				n_ctx = needed > 256 ? needed : 256;
+			}
+			const int rc = gemma_generate(gf, prompt, n_predict, n_ctx);
+			gemma_free(gf);
+			return rc;
+		}
+	}
+
 	nnc_time_init();
 	const int64_t t_main_start_us = nnc_time_us();
 
 	gpt_params params;
-	params.model = "models\\ggml-model-gpt-2-117M.bin";
+	params.model = "models\\gemma-4-E2B-it-BF16.gguf";
 
 	if (gpt_params_parse(argc, argv, params) == false)
 	{
@@ -764,147 +279,167 @@ int main(int argc, char** argv)
 
 	if (params.seed < 0)
 	{
-		params.seed = time(nullptr);
+		params.seed = static_cast<int32_t>(time(nullptr));
 	}
 
 	printf("%s: seed = %d\n", __func__, params.seed);
 
-	std::mt19937 rng(params.seed);
-	
-	if (params.prompt.empty())
+	// Interactive Gemma chat REPL: load the GGUF model once, then loop
+	// reading prompts from stdin and streaming the generated text.
+	// Ctrl-C exits.
 	{
-		params.prompt = "Why is AI the future?";
-	}
+		printf("nnc: loading %s\n", params.model.c_str());
+		printf("nnc: press Ctrl-C to exit.\n");
+		fflush(stdout);
 
-	int64_t t_load_us = 0;
-
-	gpt_vocab vocab;
-	gpt2_model model;
-
-	// load the model
-	{
-		const int64_t t_start_us = nnc_time_us();
-
-		if (!gpt2_model_load(params.model, model, vocab))
+		gemma_file gf{};
+		if (!gemma_load(params.model.c_str(), gf))
 		{
-			fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
+			fprintf(stderr, "%s: failed to load gemma model from '%s'\n",
+			        __func__, params.model.c_str());
 			return 1;
 		}
 
-		t_load_us = nnc_time_us() - t_start_us;
-	}
+		const auto& h = gf.hparams;
+		const int n_predict = params.n_predict > 0 ? params.n_predict : 256;
 
-	int n_past = 0;
-
-	int64_t t_sample_us = 0;
-	int64_t t_predict_us = 0;
-
-	std::vector<float> logits;
-
-	// tokenize the prompt
-	std::vector<gpt_vocab::id> embd_inp = gpt_tokenize(vocab, params.prompt);
-
-	params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - static_cast<int>(embd_inp.size()));
-
-	printf("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
-	printf("%s: number of tokens in prompt = %zu, first 8 tokens: ", __func__, embd_inp.size());
-	for (int i = 0; i < std::min(8, static_cast<int>(embd_inp.size())); i++)
-	{
-		printf("%d ", embd_inp[i]);
-	}
-	printf("\n\n");
-
-	// submit the input prompt token-by-token
-	// this reduces the memory usage during inference, at the cost of a bit of speed at the beginning
-	std::vector<gpt_vocab::id> embd;
-
-	// determine the required inference memory per token:
-	size_t mem_per_token = 0;
-	gpt2_eval(model, 0, {0, 1, 2, 3}, logits, mem_per_token);
-
-	for (int i = embd.size(); i < embd_inp.size() + params.n_predict; i++)
-	{
-		// predict
-		if (embd.size() > 0)
+		// Look up Gemma chat-template special tokens by piece string.
+		// Without these, the BPE merges split "<start_of_turn>" into
+		// individual characters and the instruct model never sees the
+		// real turn boundaries (and so emits one-token replies).
+		// Gemma's GGUF stores control tokens with mangled piece
+		// strings ("<|turn>" / "<turn|>") — try a few candidates.
+		auto find_token = [&](const std::initializer_list<const char*> pieces) -> int
 		{
-			const int64_t t_start_us = nnc_time_us();
+			for (const char* p : pieces)
+				for (size_t i = 0; i < gf.vocab_tokens.size(); ++i)
+					if (gf.vocab_tokens[i] == p) return static_cast<int>(i);
+			return -1;
+		};
+		const int tok_sot = find_token({"<start_of_turn>", "<|turn>"});
+		const int tok_eot = find_token({"<end_of_turn>", "<turn|>"});
+		const int tok_nl = find_token({"\n"});
+		// Tokenize the literal words "user" / "model" (no BOS) so we
+		// don't depend on their absolute ids.
+		std::vector<int> tok_user_word = gemma_tokenize(gf, "user", false);
+		std::vector<int> tok_model_word = gemma_tokenize(gf, "model", false);
 
-			if (!gpt2_eval(model, n_past, embd, logits, mem_per_token))
-			{
-				printf("Failed to predict\n");
-				return 1;
-			}
+		const bool have_template = tok_sot >= 0 && tok_eot >= 0 && tok_nl >= 0;
 
-			t_predict_us += nnc_time_us() - t_start_us;
+		// Allocate the KV cache once for the entire REPL session and
+		// keep appending across turns so the model actually sees the
+		// conversation history. Use a fixed context window; on overflow
+		// we wipe the cache and warn the user. Type `/reset` (or
+		// `/clear`) at the prompt to start a fresh conversation, `/exit`
+		// (or `/quit`) to leave.
+		const int n_ctx = 4096;
+		gemma_kv_cache cache;
+		if (!gemma_kv_init(gf, cache, n_ctx))
+		{
+			fprintf(stderr, "nnc: failed to init kv cache\n");
+			gemma_free(gf);
+			return 1;
 		}
 
-		n_past += embd.size();
-		embd.clear();
-
-		if (i >= embd_inp.size())
+		std::string line;
+		while (true)
 		{
-			// sample next token
-			const int top_k = params.top_k;
-			const float top_p = params.top_p;
-			const float temp = params.temp;
-
-			const int n_vocab = model.hparams.n_vocab;
-
-			gpt_vocab::id id = 0;
-
+			printf("\n> ");
+			fflush(stdout);
+			if (!std::getline(std::cin, line)) break; // EOF (e.g. Ctrl-Z)
+			if (line.empty()) continue;
+			if (line == "/exit" || line == "/quit") break;
+			if (line == "/reset" || line == "/clear")
 			{
-				const int64_t t_start_sample_us = nnc_time_us();
-
-				id = gpt_sample_top_k_top_p(vocab, logits.data() + (logits.size() - n_vocab), top_k, top_p, temp, rng);
-
-				t_sample_us += nnc_time_us() - t_start_sample_us;
+				cache.cur_pos = 0;
+				printf("nnc: kv cache reset (0/%d)\n", n_ctx);
+				continue;
 			}
 
-			// add it to the context
-			embd.push_back(id);
-		}
-		else
-		{
-			// if here, it means we are still processing the input prompt
-			for (int k = i; k < embd_inp.size(); k++)
+			// Build prompt token sequence. For instruct-tuned Gemma we
+			// wrap in <start_of_turn>user\n ... <end_of_turn>\n
+			// <start_of_turn>model\n; otherwise fall back to raw text.
+			// Only emit BOS on the very first turn — subsequent turns
+			// just append to the existing conversation.
+			std::vector<int> prompt;
+			if (have_template)
 			{
-				embd.push_back(embd_inp[k]);
-				if (embd.size() >= params.n_batch)
+				if (gf.bos_id >= 0 && cache.cur_pos == 0) prompt.push_back(gf.bos_id);
+				prompt.push_back(tok_sot);
+				prompt.insert(prompt.end(), tok_user_word.begin(), tok_user_word.end());
+				prompt.push_back(tok_nl);
 				{
+					const std::vector<int> body = gemma_tokenize(gf, line, false);
+					prompt.insert(prompt.end(), body.begin(), body.end());
+				}
+				prompt.push_back(tok_eot);
+				prompt.push_back(tok_nl);
+				prompt.push_back(tok_sot);
+				prompt.insert(prompt.end(), tok_model_word.begin(), tok_model_word.end());
+				prompt.push_back(tok_nl);
+			}
+			else
+			{
+				prompt = gemma_tokenize(gf, line,
+				                        gf.add_bos_token && cache.cur_pos == 0);
+			}
+			if (prompt.empty()) continue;
+
+			// If this turn won't fit, wipe the cache and start fresh
+			// (with BOS re-added if the template needs it).
+			const int needed = static_cast<int>(prompt.size()) + n_predict;
+			if (cache.cur_pos + needed > n_ctx)
+			{
+				printf("nnc: context full (%d + %d > %d), resetting kv cache\n",
+				       cache.cur_pos, needed, n_ctx);
+				cache.cur_pos = 0;
+				if (have_template && gf.bos_id >= 0 && prompt.front() != gf.bos_id)
+					prompt.insert(prompt.begin(), gf.bos_id);
+				if (cache.cur_pos + static_cast<int>(prompt.size()) + n_predict > n_ctx)
+				{
+					fprintf(stderr, "nnc: prompt too large for n_ctx=%d, skipping\n", n_ctx);
+					continue;
+				}
+			}
+
+			// Prefill prompt tokens (no output) starting at the current
+			// cache position. Use the argmax-only path: it never
+			// materialises the n_vocab-sized logits buffer (saves ~1 MB
+			// of writes per token at vocab=262144) and skips softcap.
+			const int base_pos = cache.cur_pos;
+			int next = -1;
+			bool ok = true;
+			for (size_t i = 0; i < prompt.size(); ++i)
+			{
+				if (gemma_eval_token_argmax(gf, cache, prompt[i],
+				                            base_pos + static_cast<int>(i),
+				                            &next) != 0)
+				{
+					ok = false;
 					break;
 				}
 			}
-			i += embd.size() - 1;
+			if (!ok) continue;
+
+			// Greedy decode, streaming detokenized text to stdout. The
+			// generated tokens are appended to the same cache so the
+			// next turn sees them as context.
+			for (int g = 0; g < n_predict; ++g)
+			{
+				if (next == gf.eos_id) break;
+				const std::string piece = gemma_detokenize(gf, {next});
+				fputs(piece.c_str(), stdout);
+				fflush(stdout);
+				if (g + 1 >= n_predict) break;
+				if (cache.cur_pos >= n_ctx) break;
+				if (gemma_eval_token_argmax(gf, cache, next, cache.cur_pos, &next) != 0)
+					break;
+			}
+			printf("\n");
 		}
 
-		// display text
-		for (auto id : embd)
-		{
-			printf("%s", vocab.id_to_token[id].c_str());
-		}
-		fflush(stdout);
-
-		// end of text token
-		if (embd.back() == 50256)
-		{
-			break;
-		}
+		gemma_kv_free(cache);
+		gemma_free(gf);
+		return 0;
 	}
-
-	// report timing
-	{
-		const int64_t t_main_end_us = nnc_time_us();
-
-		printf("\n\n");
-		printf("%s: mem per token = %8zu bytes\n", __func__, mem_per_token);
-		printf("%s:     load time = %8.2f ms\n", __func__, t_load_us / 1000.0f);
-		printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us / 1000.0f);
-		printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us / 1000.0f,
-		       t_predict_us / 1000.0f / n_past);
-		printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us) / 1000.0f);
-	}
-
-	nnc_free(model.ctx);
-
-	return 0;
 }

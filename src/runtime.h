@@ -1,8 +1,10 @@
-// nnc runtime: arena, tensor graph, and forward dispatch for GPT-2 inference.
+// nnc runtime: arena, tensor graph, and forward dispatch for the Gemma
+// GGUF inference path.
 
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 #define NNC_MAX_DIMS  4
 #define NNC_MAX_NODES 4096
@@ -15,16 +17,37 @@
 #endif
 
 using nnc_fp16_t = uint16_t;
+using nnc_bf16_t = uint16_t;
 
 enum nnc_type
 {
 	NNC_TYPE_F32 = 0,
 	NNC_TYPE_F16 = 1,
-	NNC_TYPE_Q4_0 = 2,
-	NNC_TYPE_Q4_1 = 3,
-	NNC_TYPE_I32 = 4,
+	NNC_TYPE_I32 = 2,
+	NNC_TYPE_BF16 = 3,
 	NNC_TYPE_COUNT,
 };
+
+// --- bf16 helpers (IEEE 754 truncation: u32(f32) >> 16) ---
+static inline float nnc_bf16_to_f32(const nnc_bf16_t v)
+{
+	const uint32_t u = static_cast<uint32_t>(v) << 16;
+	float f;
+	std::memcpy(&f, &u, 4);
+	return f;
+}
+
+static inline nnc_bf16_t nnc_f32_to_bf16(const float f)
+{
+	uint32_t u;
+	std::memcpy(&u, &f, 4);
+	// round-to-nearest-even
+	const uint32_t rounding_bias = 0x7fff + ((u >> 16) & 1);
+	return static_cast<nnc_bf16_t>((u + rounding_bias) >> 16);
+}
+
+// AVX2 batched bf16 -> f32 conversion (n must be multiple of 8).
+void nnc_bf16_to_f32_row(const nnc_bf16_t* src, float* dst, size_t n);
 
 enum nnc_op
 {
@@ -114,7 +137,7 @@ struct nnc_tensor* nnc_permute(struct nnc_context* ctx, struct nnc_tensor* a, in
 
 // --- graph build + run ---
 void nnc_build_forward_expand(struct nnc_cgraph* g, struct nnc_tensor* root);
-void nnc_graph_compute(struct nnc_context* ctx, struct nnc_cgraph* g);
+void nnc_graph_compute(struct nnc_context* ctx, const struct nnc_cgraph* g);
 
 // --- timing helpers (microseconds since process start) ---
 void nnc_time_init();

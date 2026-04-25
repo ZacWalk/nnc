@@ -35,3 +35,24 @@ void nnc_build_dot_f16_to_f32(jit_buffer& buf, uint32_t n);
 // per-row vec_dot_f16 and skips its FP32->FP16 packing of x
 // entirely. Saves rsi+rdi in prologue (Win64 nonvolatile).
 void nnc_build_gemv_f16w_f32x(jit_buffer& buf, uint32_t rows, uint32_t cols);
+
+// Emits  void gemv_bf16w_f32x(const bf16* W, const float* x, float* y);
+// rcx=W, rdx=x, r8=y. rows and cols are baked into the emitted code as
+// 32-bit immediates. cols must be a positive multiple of 8.
+//
+// Layout: y[r] = sum_{k=0..cols-1} bf16_to_fp32(W[r*cols + k]) * x[k].
+//
+// BF16 -> F32 is implemented as `vpmovzxwd` (8 u16 -> 8 u32) + `vpslld 16`
+// (so the BF16 bit-pattern becomes the high half of the FP32 word). Same
+// 4-accumulator unrolling as the FP16 builder when cols % 32 == 0.
+void nnc_build_gemv_bf16w_f32x(jit_buffer& buf, uint32_t rows, uint32_t cols);
+
+// Emits  void gemv_bf16w_f32x_4row(const bf16* W, const float* x, float* y);
+// Same ABI as nnc_build_gemv_bf16w_f32x but processes 4 rows in parallel
+// per outer iteration: the x[k..k+7] tile is loaded once per inner step
+// and broadcast to 4 independent FMA accumulators (one per row), cutting
+// x-side bandwidth by 4x. The 4 row partial-sums are reduced with a
+// single 3-vhaddps tree and stored as a contiguous [a,b,c,d] xmm.
+//
+// Requires rows > 0 and rows % 4 == 0, cols > 0 and cols % 8 == 0.
+void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, uint32_t rows, uint32_t cols);

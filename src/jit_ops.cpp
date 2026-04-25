@@ -307,3 +307,218 @@ void nnc_build_gemv_f16w_f32x(jit_buffer& buf, const uint32_t rows, const uint32
 	e.pop_r64(gpr::rsi);
 	e.ret();
 }
+
+// =====================================================================
+// gemv_bf16w_f32x(W, x, y)   — rows and cols baked.
+//   rcx=W (bf16)  rdx=x (fp32)  r8=y (fp32)
+//
+// Identical structure to gemv_f16w_f32x, but BF16 -> F32 uses
+//   vpmovzxwd ymm, [m128]   ; 8 u16 -> 8 u32 (zero-ext)
+//   vpslld    ymm, ymm, 16  ; bf16 bits -> high half of f32
+// instead of vcvtph2ps. BF16 row stride is also cols*2 bytes.
+// =====================================================================
+void nnc_build_gemv_bf16w_f32x(jit_buffer& buf, const uint32_t rows, const uint32_t cols)
+{
+	assert(rows > 0);
+	assert(cols > 0 && (cols % 8) == 0);
+
+	x64_emitter e(buf);
+	avx2_emitter v(buf);
+
+	const bool unroll4 = (cols % 32) == 0;
+
+	e.push_r64(gpr::rsi);
+	e.push_r64(gpr::rdi);
+	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y
+	e.xor_r32_r32(gpr::rdi, gpr::rdi); // row = 0
+
+	const int32_t row_bytes = static_cast<int32_t>(cols) * 2; // BF16 row stride
+
+	const size_t row_loop = buf.size();
+
+	v.vxorps_ymm(ymm::y0, ymm::y0, ymm::y0);
+	if (unroll4)
+	{
+		v.vxorps_ymm(ymm::y1, ymm::y1, ymm::y1);
+		v.vxorps_ymm(ymm::y2, ymm::y2, ymm::y2);
+		v.vxorps_ymm(ymm::y3, ymm::y3, ymm::y3);
+	}
+	e.xor_r32_r32(gpr::rax, gpr::rax); // i = 0
+
+	const size_t col_loop = buf.size();
+	if (unroll4)
+	{
+		v.vpmovzxwd_ymm_load_basex2(ymm::y4, gpr::rcx, gpr::rax);
+		v.vpslld_ymm_imm8(ymm::y4, ymm::y4, 16);
+		v.vmovups_ymm_load_basex4(ymm::y5, gpr::rdx, gpr::rax);
+		v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y4, ymm::y5);
+
+		v.vpmovzxwd_ymm_load_basex2_disp8(ymm::y4, gpr::rcx, gpr::rax, 16);
+		v.vpslld_ymm_imm8(ymm::y4, ymm::y4, 16);
+		v.vmovups_ymm_load_basex4_disp8(ymm::y5, gpr::rdx, gpr::rax, 32);
+		v.vfmadd231ps_ymm_ymm_ymm(ymm::y1, ymm::y4, ymm::y5);
+
+		v.vpmovzxwd_ymm_load_basex2_disp8(ymm::y4, gpr::rcx, gpr::rax, 32);
+		v.vpslld_ymm_imm8(ymm::y4, ymm::y4, 16);
+		v.vmovups_ymm_load_basex4_disp8(ymm::y5, gpr::rdx, gpr::rax, 64);
+		v.vfmadd231ps_ymm_ymm_ymm(ymm::y2, ymm::y4, ymm::y5);
+
+		v.vpmovzxwd_ymm_load_basex2_disp8(ymm::y4, gpr::rcx, gpr::rax, 48);
+		v.vpslld_ymm_imm8(ymm::y4, ymm::y4, 16);
+		v.vmovups_ymm_load_basex4_disp8(ymm::y5, gpr::rdx, gpr::rax, 96);
+		v.vfmadd231ps_ymm_ymm_ymm(ymm::y3, ymm::y4, ymm::y5);
+
+		e.add_r64_imm8(gpr::rax, 32);
+	}
+	else
+	{
+		v.vpmovzxwd_ymm_load_basex2(ymm::y4, gpr::rcx, gpr::rax);
+		v.vpslld_ymm_imm8(ymm::y4, ymm::y4, 16);
+		v.vmovups_ymm_load_basex4(ymm::y5, gpr::rdx, gpr::rax);
+		v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y4, ymm::y5);
+		e.add_r64_imm8(gpr::rax, 8);
+	}
+	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
+	{
+		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
+		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
+		assert(disp >= -128 && disp <= 127);
+		e.jl_rel8(static_cast<int8_t>(disp));
+	}
+
+	if (unroll4)
+	{
+		v.vaddps_ymm(ymm::y0, ymm::y0, ymm::y1);
+		v.vaddps_ymm(ymm::y2, ymm::y2, ymm::y3);
+		v.vaddps_ymm(ymm::y0, ymm::y0, ymm::y2);
+	}
+
+	v.vextractf128_xmm_ymm(ymm::y1, ymm::y0, 1);
+	v.vaddps_xmm(ymm::y0, ymm::y0, ymm::y1);
+	v.vhaddps_xmm(ymm::y0, ymm::y0, ymm::y0);
+	v.vhaddps_xmm(ymm::y0, ymm::y0, ymm::y0);
+
+	v.vmovss_store_basex4(gpr::rsi, gpr::rdi, ymm::y0);
+
+	e.add_r64_imm32(gpr::rcx, row_bytes);
+	e.add_r64_imm8(gpr::rdi, 1);
+	e.cmp_r64_imm32(gpr::rdi, static_cast<int32_t>(rows));
+	{
+		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 6;
+		const ptrdiff_t disp = static_cast<ptrdiff_t>(row_loop) - after_jl;
+		e.jl_rel32(static_cast<int32_t>(disp));
+	}
+
+	v.vzeroupper();
+	e.pop_r64(gpr::rdi);
+	e.pop_r64(gpr::rsi);
+	e.ret();
+}
+
+// =====================================================================
+// gemv_bf16w_f32x_4row(W, x, y)   — rows and cols baked. 4 rows / iter.
+//   rcx=W (bf16)  rdx=x (fp32)  r8=y (fp32)
+//
+// Inner-loop body (one 8-col tile per iter):
+//   ymm4   = vmovups   [rdx + rax*4]                ; x[k..k+7]
+//   ymm5   = vpmovzxwd [rcx + rax*2 + 0*RB] ; vpslld 16 ; vfmadd y0,y5,y4
+//   ymm5   = vpmovzxwd [rcx + rax*2 + 1*RB] ; vpslld 16 ; vfmadd y1,y5,y4
+//   ymm5   = vpmovzxwd [rcx + rax*2 + 2*RB] ; vpslld 16 ; vfmadd y2,y5,y4
+//   ymm5   = vpmovzxwd [rcx + rax*2 + 3*RB] ; vpslld 16 ; vfmadd y3,y5,y4
+//   add rax, 8 ; cmp rax, cols ; jl
+//
+// Tail reduction (4 ymms -> 4 contiguous floats):
+//   y0 = vhaddps_ymm(y0, y1)       ; per-lane: (a01,a23,b01,b23) x 2
+//   y2 = vhaddps_ymm(y2, y3)
+//   y0 = vhaddps_ymm(y0, y2)       ; per-lane: (a,b,c,d) x 2
+//   x1 = vextractf128 y0, 1
+//   x0 = vaddps_xmm(x0, x1)        ; [sum_a, sum_b, sum_c, sum_d]
+//   vmovups [rsi + rdi*4], xmm0    ; 16-byte store
+//
+// Then: add rcx, 4*RB ; add rdi, 4 ; cmp rdi, rows ; jl
+//
+// Stack: 2 push_r64 = 16 bytes. No additional sub rsp.
+// =====================================================================
+void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, const uint32_t rows, const uint32_t cols)
+{
+	assert(rows > 0 && (rows % 4) == 0);
+	assert(cols > 0 && (cols % 8) == 0);
+
+	x64_emitter e(buf);
+	avx2_emitter v(buf);
+
+	const int32_t row_bytes = static_cast<int32_t>(cols) * 2; // BF16 row stride
+
+	e.push_r64(gpr::rsi);
+	e.push_r64(gpr::rdi);
+	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y
+	e.xor_r32_r32(gpr::rdi, gpr::rdi); // row_group = 0
+
+	const size_t row_loop = buf.size();
+
+	v.vxorps_ymm(ymm::y0, ymm::y0, ymm::y0);
+	v.vxorps_ymm(ymm::y1, ymm::y1, ymm::y1);
+	v.vxorps_ymm(ymm::y2, ymm::y2, ymm::y2);
+	v.vxorps_ymm(ymm::y3, ymm::y3, ymm::y3);
+	e.xor_r32_r32(gpr::rax, gpr::rax); // i = 0
+
+	const size_t col_loop = buf.size();
+
+	// x tile (shared across all 4 row FMAs)
+	v.vmovups_ymm_load_basex4(ymm::y4, gpr::rdx, gpr::rax);
+
+	// Row 0: offset 0 from rcx (no displacement form).
+	v.vpmovzxwd_ymm_load_basex2(ymm::y5, gpr::rcx, gpr::rax);
+	v.vpslld_ymm_imm8(ymm::y5, ymm::y5, 16);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y5, ymm::y4);
+
+	// Rows 1..3: disp32 (row_bytes can be > 127, e.g. 4096 for cols=2048).
+	v.vpmovzxwd_ymm_load_basex2_disp32(ymm::y5, gpr::rcx, gpr::rax, row_bytes);
+	v.vpslld_ymm_imm8(ymm::y5, ymm::y5, 16);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y1, ymm::y5, ymm::y4);
+
+	v.vpmovzxwd_ymm_load_basex2_disp32(ymm::y5, gpr::rcx, gpr::rax, row_bytes * 2);
+	v.vpslld_ymm_imm8(ymm::y5, ymm::y5, 16);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y2, ymm::y5, ymm::y4);
+
+	v.vpmovzxwd_ymm_load_basex2_disp32(ymm::y5, gpr::rcx, gpr::rax, row_bytes * 3);
+	v.vpslld_ymm_imm8(ymm::y5, ymm::y5, 16);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y3, ymm::y5, ymm::y4);
+
+	e.add_r64_imm8(gpr::rax, 8);
+	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
+	{
+		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
+		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
+		// Inner body grows with disp32 forms; if it ever exceeds rel8,
+		// we'd need rel32. For all current Gemma shapes the body stays
+		// well under 100 bytes, so this fits.
+		assert(disp >= -128 && disp <= 127);
+		e.jl_rel8(static_cast<int8_t>(disp));
+	}
+
+	// Reduce 4 ymm partial sums into 4 contiguous floats in xmm0.
+	v.vhaddps_ymm(ymm::y0, ymm::y0, ymm::y1);
+	v.vhaddps_ymm(ymm::y2, ymm::y2, ymm::y3);
+	v.vhaddps_ymm(ymm::y0, ymm::y0, ymm::y2);
+	v.vextractf128_xmm_ymm(ymm::y1, ymm::y0, 1);
+	v.vaddps_xmm(ymm::y0, ymm::y0, ymm::y1);
+
+	// Store 4 floats at y[rdi .. rdi+3].
+	v.vmovups_xmm_store_basex4(gpr::rsi, gpr::rdi, ymm::y0);
+
+	// Advance to next row-group of 4.
+	e.add_r64_imm32(gpr::rcx, row_bytes * 4);
+	e.add_r64_imm8(gpr::rdi, 4);
+	e.cmp_r64_imm32(gpr::rdi, static_cast<int32_t>(rows));
+	{
+		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 6;
+		const ptrdiff_t disp = static_cast<ptrdiff_t>(row_loop) - after_jl;
+		e.jl_rel32(static_cast<int32_t>(disp));
+	}
+
+	v.vzeroupper();
+	e.pop_r64(gpr::rdi);
+	e.pop_r64(gpr::rsi);
+	e.ret();
+}

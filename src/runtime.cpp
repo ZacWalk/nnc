@@ -1,6 +1,6 @@
-// nnc runtime: arena, tensor graph, and forward dispatch for GPT-2 inference.
-// Hot ops route to JIT/SIMD kernels in
-// nn_ops.cpp; the rest are simple stride-aware reference loops.
+// nnc runtime: arena, tensor graph, and forward dispatch for Gemma GGUF
+// inference. Hot ops route to JIT/SIMD kernels in nn_ops.cpp; the rest
+// are simple stride-aware reference loops.
 
 #include "runtime.h"
 #include "nn_ops.h"
@@ -53,13 +53,32 @@ struct nnc_type_info
 	size_t bytes; // bytes per storage block
 };
 
-static const nnc_type_info g_type_info[NNC_TYPE_COUNT] = {
+static constexpr nnc_type_info g_type_info[NNC_TYPE_COUNT] = {
 	/* F32  */ {1, 4},
 	/* F16  */ {1, 2},
-	/* Q4_0 */ {32, 4 + 16},
-	/* Q4_1 */ {32, 4 + 4 + 16},
 	/* I32  */ {1, 4},
+	/* BF16 */ {1, 2},
 };
+
+// AVX2 batched bf16 -> f32: 8 lanes/iter via vpmovzxwd + vpslld.
+void nnc_bf16_to_f32_row(const nnc_bf16_t* src, float* dst, const size_t n)
+{
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8)
+	{
+		const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+		const __m256i wide = _mm256_cvtepu16_epi32(lo);
+		const __m256i shifted = _mm256_slli_epi32(wide, 16);
+		_mm256_storeu_ps(dst + i, _mm256_castsi256_ps(shifted));
+	}
+	for (; i < n; ++i)
+	{
+		const uint32_t u = static_cast<uint32_t>(src[i]) << 16;
+		float f;
+		memcpy(&f, &u, 4);
+		dst[i] = f;
+	}
+}
 
 size_t nnc_type_size(const nnc_type t) { return g_type_info[t].bytes; }
 int nnc_blck_size(const nnc_type t) { return g_type_info[t].blck; }
@@ -762,7 +781,7 @@ static void forward_mul_mat_f32_f32(const nnc_tensor* dst)
 			}
 }
 
-static void forward_mul_mat(nnc_tensor* dst)
+static void forward_mul_mat(const nnc_tensor* dst)
 {
 	const nnc_type t0 = dst->src0->type;
 	const nnc_type t1 = dst->src1->type;
@@ -790,7 +809,7 @@ static void forward_mul_mat(nnc_tensor* dst)
 // graph_compute
 // ============================================================================
 
-void nnc_graph_compute(nnc_context* /*ctx*/, nnc_cgraph* g)
+void nnc_graph_compute(nnc_context* /*ctx*/, const nnc_cgraph* g)
 {
 	nnc_graph_prefuse(g);
 

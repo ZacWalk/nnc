@@ -75,6 +75,7 @@ struct jit_kernel_cache::impl
 	std::unordered_map<uint64_t, entry> gemv_;
 	std::unordered_map<uint32_t, entry> dot_f16_;
 	std::unordered_map<uint64_t, entry> gemv_f16w_f32x_;
+	std::unordered_map<uint64_t, entry> gemv_bf16w_f32x_;
 };
 
 jit_kernel_cache::jit_kernel_cache() : p_(std::make_unique<impl>())
@@ -112,7 +113,8 @@ nnc_gemv_f32_fn jit_kernel_cache::get_gemv_f32(const uint32_t rows, const uint32
 
 size_t jit_kernel_cache::size() const
 {
-	return p_->gemv_.size() + p_->dot_f16_.size() + p_->gemv_f16w_f32x_.size();
+	return p_->gemv_.size() + p_->dot_f16_.size() + p_->gemv_f16w_f32x_.size()
+		+ p_->gemv_bf16w_f32x_.size();
 }
 
 nnc_dot_f16_fn jit_kernel_cache::get_dot_f16(const uint32_t n)
@@ -155,4 +157,33 @@ nnc_gemv_f16w_f32x_fn jit_kernel_cache::get_gemv_f16w_f32x(const uint32_t rows, 
 	slot.buf = std::move(buf);
 	slot.fn = fn;
 	return reinterpret_cast<nnc_gemv_f16w_f32x_fn>(fn);
+}
+
+nnc_gemv_bf16w_f32x_fn jit_kernel_cache::get_gemv_bf16w_f32x(const uint32_t rows, const uint32_t cols)
+{
+	assert(rows > 0);
+	assert(cols > 0 && (cols % 8) == 0);
+
+	const uint64_t key = pack(rows, cols);
+	const auto it = p_->gemv_bf16w_f32x_.find(key);
+	if (it != p_->gemv_bf16w_f32x_.end())
+	{
+		return reinterpret_cast<nnc_gemv_bf16w_f32x_fn>(it->second.fn);
+	}
+
+	auto buf = std::make_unique<jit_buffer>();
+	// Prefer the 4-rows-at-a-time builder when rows is a multiple of 4:
+	// it reuses each x-tile across 4 row accumulators, cutting x-side
+	// memory bandwidth by ~4x. Falls back to the single-row builder
+	// otherwise (e.g. small odd-shape kernels in tests).
+	if ((rows % 4) == 0)
+		nnc_build_gemv_bf16w_f32x_4row(*buf, rows, cols);
+	else
+		nnc_build_gemv_bf16w_f32x(*buf, rows, cols);
+	void* fn = buf->commit();
+
+	auto& slot = p_->gemv_bf16w_f32x_[key];
+	slot.buf = std::move(buf);
+	slot.fn = fn;
+	return reinterpret_cast<nnc_gemv_bf16w_f32x_fn>(fn);
 }

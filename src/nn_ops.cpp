@@ -7,12 +7,18 @@
 #include "nn_ops.h"
 
 #include "jit_kernel.h"
+#include "runtime.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
+#include <limits>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 // Horizontal reduce: sum of 8 floats in a ymm register.
 static inline float hsum_ymm(const __m256 v)
@@ -299,6 +305,40 @@ void nnc_layernorm_f32(float* y, const float* x, const size_t n, const float eps
 	for (; i < n; ++i) y[i] *= scale;
 }
 
+// ---- rmsnorm (no affine; y[i] = x[i] / sqrt(mean(x^2) + eps)) ----
+
+void nnc_rmsnorm_f32(float* y, const float* x, const size_t n, const float eps)
+{
+	if (n == 0) return;
+
+	// Pass 1: sum-of-squares.
+	double sum2 = 0.0;
+	{
+		size_t i = 0;
+		if (n >= 8)
+		{
+			__m256 vs2 = _mm256_setzero_ps();
+			for (; i + 8 <= n; i += 8)
+			{
+				const __m256 v = _mm256_loadu_ps(x + i);
+				vs2 = _mm256_fmadd_ps(v, v, vs2);
+			}
+			sum2 = static_cast<double>(hsum_ymm(vs2));
+		}
+		for (; i < n; ++i) sum2 += static_cast<double>(x[i]) * x[i];
+	}
+
+	// Pass 2: y[i] = x[i] * scale.
+	const float scale = static_cast<float>(1.0 / std::sqrt(sum2 / static_cast<double>(n) + eps));
+	const __m256 vscale = _mm256_set1_ps(scale);
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8)
+	{
+		_mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vscale));
+	}
+	for (; i < n; ++i) y[i] = x[i] * scale;
+}
+
 // ---- fused FP16 W * FP32 x -> FP32 y gemv ------------------------------
 
 void nnc_gemv_f16w_f32x(const void* W, const float* x, float* y,
@@ -346,9 +386,440 @@ void nnc_add_inplace_f32(float* y, const float* b, const size_t n)
 	for (; i < n; ++i) y[i] += b[i];
 }
 
-// ---- graph-level fusion: mul_mat -> repeat(bias) -> add ----------------
+// ---- elementwise multiply ----------------------------------------------
 
-#include "runtime.h"
+void nnc_mul_inplace_f32(float* y, const float* s, const size_t n)
+{
+	size_t i = 0;
+	const size_t np = n & ~size_t{7};
+	for (; i < np; i += 8)
+	{
+		_mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(s + i)));
+	}
+	for (; i < n; ++i) y[i] *= s[i];
+}
+
+// ---- BF16-weight, FP32-activation gemv ---------------------------------
+//
+// AVX2 path processes 8 cols at a time. BF16 -> F32 is a free shift:
+//   f32 = (u32)(bf16) << 16
+// Implemented as vpmovzxwd (zero-extend 8 u16 to 8 u32) + vpslld(16) +
+// vfmadd231ps. Falls through to a scalar reference for the column tail
+// or when cols < 8.
+//
+// Multi-threaded fast path: when the gemv is "big enough" (rows >= 256 and
+// cols >= 256) and rows is a multiple of 4, we split the row axis across
+// a static worker pool. Each worker calls a single shared (rows=4)-baked
+// JIT kernel on its slice — this keeps the kernel cache to one entry per
+// `cols` while still benefitting from the 4-row inner-loop. The pool is
+// created lazily on first use (workers spin briefly then yield while
+// idle, avoiding condition-variable wakeup latency on the hot path).
+
+namespace
+{
+	// Lightweight bring-your-own-task pool. Workers spin a few thousand
+	// pause/yield iterations on `cur_ticket` advancing, then run
+	// `task_fn(tid+1, task_user)`. Dispatch latency is sub-microsecond
+	// when workers are warm, far below the cost of any gemv we care
+	// about parallelising.
+	class nnc_gemv_pool
+	{
+	public:
+		using task_fn_t = void (*)(int tid, void* user);
+
+		static nnc_gemv_pool& global()
+		{
+			static nnc_gemv_pool p(decide_n_workers());
+			return p;
+		}
+
+		// Total participating threads = main + workers.
+		int n_threads() const { return static_cast<int>(workers_.size()) + 1; }
+
+		// Run `fn(tid, user)` for tid in [0, n_threads()). Main thread
+		// runs tid=0; the n_workers workers run tids 1..n. Blocks until
+		// all participants finish.
+		void dispatch(const task_fn_t fn, void* user)
+		{
+			const int nw = static_cast<int>(workers_.size());
+			task_fn_ = fn;
+			task_user_ = user;
+			// Snapshot per-worker baselines, advance ticket, run main
+			// share, spin-wait for workers.
+			unsigned baselines[64];
+			for (int i = 0; i < nw; ++i)
+				baselines[i] = workers_[i]->done.load(std::memory_order_acquire);
+			cur_ticket_.fetch_add(1, std::memory_order_release);
+			fn(0, user);
+			for (int i = 0; i < nw; ++i)
+			{
+				while (workers_[i]->done.load(std::memory_order_acquire) == baselines[i])
+					_mm_pause();
+			}
+		}
+
+		~nnc_gemv_pool()
+		{
+			stop_.store(true, std::memory_order_release);
+			cur_ticket_.fetch_add(1, std::memory_order_release);
+			for (auto& w : workers_) w->thr.join();
+		}
+
+	private:
+		struct slot
+		{
+			std::thread thr;
+			std::atomic<unsigned> done{0};
+		};
+
+		static int decide_n_workers()
+		{
+			const unsigned hw = std::thread::hardware_concurrency();
+			// Cap at 8 workers (9 threads total). For Gemma E2B the
+			// per-token gemv compute is small enough that beyond ~8
+			// threads we hit dispatch overhead and DRAM saturation.
+			const unsigned t = (hw > 0 ? hw : 1);
+			const unsigned use = (t > 8) ? 8u : t;
+			return (use > 1 ? static_cast<int>(use) - 1 : 0);
+		}
+
+		explicit nnc_gemv_pool(const int n)
+		{
+			workers_.reserve(n);
+			for (int i = 0; i < n; ++i)
+			{
+				workers_.push_back(std::make_unique<slot>());
+				workers_.back()->thr = std::thread([this, i] { worker_loop(i); });
+			}
+		}
+
+		void worker_loop(const int i)
+		{
+			unsigned last = 0;
+			auto& w = *workers_[i];
+			while (!stop_.load(std::memory_order_acquire))
+			{
+				unsigned t;
+				int spins = 0;
+				for (;;)
+				{
+					t = cur_ticket_.load(std::memory_order_acquire);
+					if (t != last) break;
+					if (stop_.load(std::memory_order_acquire)) return;
+					if (++spins > 4096)
+					{
+						std::this_thread::yield();
+						spins = 0;
+					}
+					else
+					{
+						_mm_pause();
+					}
+				}
+				last = t;
+				if (stop_.load(std::memory_order_acquire)) return;
+				task_fn_(i + 1, task_user_);
+				w.done.fetch_add(1, std::memory_order_release);
+			}
+		}
+
+		std::vector<std::unique_ptr<slot>> workers_;
+		std::atomic<unsigned> cur_ticket_{0};
+		std::atomic<bool> stop_{false};
+		task_fn_t task_fn_ = nullptr;
+		void* task_user_ = nullptr;
+	};
+
+	struct bf16_gemv_ctx
+	{
+		const uint8_t* W;
+		const float* x;
+		float* y;
+		uint32_t cols;
+		uint32_t total_quads; // rows / 4
+		int n_threads;
+		nnc_gemv_bf16w_f32x_fn fn4;
+	};
+
+	void bf16_gemv_worker(const int tid, void* u)
+	{
+		const auto* c = static_cast<const bf16_gemv_ctx*>(u);
+		const uint32_t per = c->total_quads / static_cast<uint32_t>(c->n_threads);
+		const uint32_t rem = c->total_quads % static_cast<uint32_t>(c->n_threads);
+		const uint32_t q0 = static_cast<uint32_t>(tid) * per
+			+ std::min(static_cast<uint32_t>(tid), rem);
+		const uint32_t q1 = q0 + per + (static_cast<uint32_t>(tid) < rem ? 1u : 0u);
+		if (q0 == q1) return;
+		const size_t row_stride = static_cast<size_t>(c->cols) * 2;
+		const size_t group_stride = row_stride * 4;
+		const uint8_t* W_tid = c->W + q0 * group_stride;
+		float* y_tid = c->y + q0 * 4;
+		for (uint32_t q = q0; q < q1; ++q)
+		{
+			c->fn4(W_tid, c->x, y_tid);
+			W_tid += group_stride;
+			y_tid += 4;
+		}
+	}
+}
+
+void nnc_gemv_bf16w_f32x(const void* W, const float* x, float* y,
+                         const uint32_t rows, const uint32_t cols)
+{
+	if (rows == 0 || cols == 0) return;
+
+	if ((cols & 7u) == 0)
+	{
+		// Parallel path: rows must be a multiple of 4 (so we can use the
+		// shared 4-row JIT kernel) and the gemv must be big enough to
+		// amortise dispatch overhead. Threshold ~256 rows captures every
+		// significant Gemma weight (Q/K/V/O/gate/up/down + lm_head) but
+		// keeps tiny kernels (e.g. PLE on small ple_dim) on the fast
+		// single-threaded path.
+		auto& pool = nnc_gemv_pool::global();
+		const int n_threads = pool.n_threads();
+		if (n_threads > 1 && (rows & 3u) == 0 && rows >= 256 && cols >= 256)
+		{
+			nnc_gemv_bf16w_f32x_fn fn4;
+			{
+				std::lock_guard<std::mutex> lock(global_cache_mutex());
+				fn4 = global_cache().get_gemv_bf16w_f32x(4, cols);
+			}
+			bf16_gemv_ctx ctx{
+				static_cast<const uint8_t*>(W), x, y, cols,
+				rows / 4, n_threads, fn4
+			};
+			pool.dispatch(&bf16_gemv_worker, &ctx);
+			return;
+		}
+
+		nnc_gemv_bf16w_f32x_fn fn;
+		{
+			std::lock_guard<std::mutex> lock(global_cache_mutex());
+			fn = global_cache().get_gemv_bf16w_f32x(rows, cols);
+		}
+		fn(W, x, y);
+		return;
+	}
+
+	// Scalar fallback (cols not a multiple of 8).
+	const auto Wb = static_cast<const uint16_t*>(W);
+	for (uint32_t r = 0; r < rows; ++r)
+	{
+		const uint16_t* row = Wb + static_cast<size_t>(r) * cols;
+		double s = 0.0;
+		for (uint32_t k = 0; k < cols; ++k)
+		{
+			const uint32_t u = static_cast<uint32_t>(row[k]) << 16;
+			float wf;
+			std::memcpy(&wf, &u, 4);
+			s += static_cast<double>(wf) * x[k];
+		}
+		y[r] = static_cast<float>(s);
+	}
+}
+
+// ---- Streaming BF16-weight gemv + argmax -------------------------------
+//
+// For lm_head / final logits projection in greedy decode: compute the
+// gemv 4 rows at a time directly into a tiny scratch and update a
+// running argmax. Never materialises the full vocab-sized logits buffer.
+// Saves ~1 MB of writes per token (vocab=262144) plus the softcap pass
+// (softcap is monotonic and doesn't change argmax).
+
+int nnc_gemv_bf16w_argmax_f32x(const void* W, const float* x,
+                               const uint32_t rows, const uint32_t cols)
+{
+	if (rows == 0 || cols == 0) return -1;
+
+	if ((rows & 3u) == 0 && (cols & 7u) == 0)
+	{
+		nnc_gemv_bf16w_f32x_fn fn4;
+		{
+			std::lock_guard<std::mutex> lock(global_cache_mutex());
+			fn4 = global_cache().get_gemv_bf16w_f32x(4, cols);
+		}
+		const auto Wb = static_cast<const uint8_t*>(W);
+		const size_t row_stride = static_cast<size_t>(cols) * 2; // BF16 bytes/row
+
+		// Parallel path: split the row axis. Each worker computes its
+		// local (best_val, best_idx); main reduces across workers. The
+		// argmax is the dominant cost at lm_head (rows = vocab = 262144),
+		// so this is the highest-payoff parallel site in the model.
+		auto& pool = nnc_gemv_pool::global();
+		const int n_threads = pool.n_threads();
+		if (n_threads > 1 && rows >= 256 && cols >= 256)
+		{
+			struct local
+			{
+				float bv;
+				int bi;
+			};
+			alignas(64) local locals[64]{};
+			for (int i = 0; i < n_threads; ++i)
+			{
+				locals[i].bv = -std::numeric_limits<float>::infinity();
+				locals[i].bi = -1;
+			}
+
+			struct argmax_ctx
+			{
+				const uint8_t* W;
+				const float* x;
+				size_t row_stride;
+				uint32_t total_quads;
+				int n_threads;
+				nnc_gemv_bf16w_f32x_fn fn4;
+				local* locals;
+			} c{
+				Wb, x, row_stride, rows / 4, n_threads, fn4, locals
+			};
+
+			pool.dispatch([](const int tid, void* u)
+			{
+				const auto* cc = static_cast<const argmax_ctx*>(u);
+				const uint32_t per = cc->total_quads / static_cast<uint32_t>(cc->n_threads);
+				const uint32_t rem = cc->total_quads % static_cast<uint32_t>(cc->n_threads);
+				const uint32_t q0 = static_cast<uint32_t>(tid) * per
+					+ std::min(static_cast<uint32_t>(tid), rem);
+				const uint32_t q1 = q0 + per + (static_cast<uint32_t>(tid) < rem ? 1u : 0u);
+				if (q0 == q1) return;
+				alignas(16) float scratch[4];
+				float bv = -std::numeric_limits<float>::infinity();
+				int bi = -1;
+				const size_t group_stride = cc->row_stride * 4;
+				const uint8_t* Wp = cc->W + q0 * group_stride;
+				for (uint32_t q = q0; q < q1; ++q)
+				{
+					cc->fn4(Wp, cc->x, scratch);
+					const int base = static_cast<int>(q) * 4;
+					if (scratch[0] > bv) { bv = scratch[0]; bi = base; }
+					if (scratch[1] > bv) { bv = scratch[1]; bi = base + 1; }
+					if (scratch[2] > bv) { bv = scratch[2]; bi = base + 2; }
+					if (scratch[3] > bv) { bv = scratch[3]; bi = base + 3; }
+					Wp += group_stride;
+				}
+				cc->locals[tid].bv = bv;
+				cc->locals[tid].bi = bi;
+			}, &c);
+
+			int best = locals[0].bi;
+			float bv = locals[0].bv;
+			for (int i = 1; i < n_threads; ++i)
+			{
+				if (locals[i].bi >= 0 && locals[i].bv > bv)
+				{
+					bv = locals[i].bv;
+					best = locals[i].bi;
+				}
+			}
+			return best;
+		}
+
+		// Single-threaded fast path.
+		alignas(16) float scratch[4];
+		int best = 0;
+		float bv = -std::numeric_limits<float>::infinity();
+		for (uint32_t r = 0; r < rows; r += 4)
+		{
+			fn4(Wb + static_cast<size_t>(r) * row_stride, x, scratch);
+			if (scratch[0] > bv) { bv = scratch[0]; best = static_cast<int>(r); }
+			if (scratch[1] > bv) { bv = scratch[1]; best = static_cast<int>(r) + 1; }
+			if (scratch[2] > bv) { bv = scratch[2]; best = static_cast<int>(r) + 2; }
+			if (scratch[3] > bv) { bv = scratch[3]; best = static_cast<int>(r) + 3; }
+		}
+		return best;
+	}
+
+	// Generic fallback: full materialise then linear scan.
+	std::vector<float> tmp(rows);
+	nnc_gemv_bf16w_f32x(W, x, tmp.data(), rows, cols);
+	int best = 0;
+	float bv = tmp[0];
+	for (uint32_t r = 1; r < rows; ++r)
+	{
+		if (tmp[r] > bv) { bv = tmp[r]; best = static_cast<int>(r); }
+	}
+	return best;
+}
+
+// ---- SwiGLU ------------------------------------------------------------
+//
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// y[i] = silu(gate[i]) * up[i]
+//
+// Uses the existing exp_ps approximation if available; otherwise the
+// std::exp scalar path. AVX2 inner uses 1 / (1 + exp(-g)) per lane via
+// rcp_ps or a Cephes-style poly. Keep it simple: scalar std::exp inside
+// an 8-wide gather/scatter wrapper. This is not in the model's hottest
+// inner loop so accuracy beats throughput here.
+
+void nnc_swiglu_f32(float* y, const float* gate, const float* up, const size_t n)
+{
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float g = gate[i];
+		const float sig = 1.0f / (1.0f + std::exp(-g));
+		y[i] = g * sig * up[i];
+	}
+}
+
+// ---- RoPE (NeoX / half-pair convention) --------------------------------
+
+void nnc_rope_f32(float* x, const uint32_t n_heads, const uint32_t head_dim,
+                  const uint32_t n_rot, const int32_t pos, const float freq_base)
+{
+	if (n_rot == 0 || (n_rot & 1u) != 0) return; // n_rot must be even
+	const uint32_t half = n_rot / 2;
+	const float p = static_cast<float>(pos);
+	for (uint32_t h = 0; h < n_heads; ++h)
+	{
+		float* xh = x + static_cast<size_t>(h) * head_dim;
+		for (uint32_t i = 0; i < half; ++i)
+		{
+			const float inv = std::pow(freq_base,
+			                           -static_cast<float>(2 * i) / static_cast<float>(n_rot));
+			const float theta = p * inv;
+			const float c = std::cos(theta);
+			const float s = std::sin(theta);
+			const float a = xh[i];
+			const float b = xh[i + half];
+			xh[i] = c * a - s * b;
+			xh[i + half] = s * a + c * b;
+		}
+	}
+}
+
+// ---- soft-cap (tanh(x/c)*c) --------------------------------------------
+
+void nnc_softcap_f32(float* y, const float* x, const size_t n, const float cap)
+{
+	const float inv = 1.0f / cap;
+	for (size_t i = 0; i < n; ++i)
+		y[i] = std::tanh(x[i] * inv) * cap;
+}
+
+// ---- BF16 embedding-row lookup with optional scale ---------------------
+
+void nnc_embed_row_bf16(float* y, const void* table, const int token_id,
+                        const size_t n_embd, const float scale)
+{
+	const auto* row = static_cast<const uint16_t*>(table)
+		+ static_cast<size_t>(token_id) * n_embd;
+	// Inflate BF16 -> F32 then multiply by `scale`. Two-pass keeps the
+	// SIMD code in nnc_bf16_to_f32_row simple.
+	nnc_bf16_to_f32_row(row, y, n_embd);
+	if (scale != 1.0f)
+	{
+		const __m256 vs = _mm256_set1_ps(scale);
+		size_t i = 0;
+		for (; i + 8 <= n_embd; i += 8)
+			_mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), vs));
+		for (; i < n_embd; ++i) y[i] *= scale;
+	}
+}
+
+// ---- graph-level fusion: mul_mat -> repeat(bias) -> add ----------------
 
 #include <unordered_map>
 

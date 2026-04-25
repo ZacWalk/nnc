@@ -51,15 +51,31 @@ public:
 	// ymm dst <- vcvtph2ps(xmmword [base + index*2 + disp8])  (mod=01 SIB)
 	void vcvtph2ps_ymm_load_basex2_disp8(ymm dst, gpr base, gpr index, int8_t disp);
 
+	// ymm dst <- vpmovzxwd(xmmword [base + index*2])  (8 u16 -> 8 u32, zero-ext)
+	void vpmovzxwd_ymm_load_basex2(ymm dst, gpr base, gpr index);
+
+	// ymm dst <- vpmovzxwd(xmmword [base + index*2 + disp8])  (mod=01 SIB)
+	void vpmovzxwd_ymm_load_basex2_disp8(ymm dst, gpr base, gpr index, int8_t disp);
+
+	// ymm dst <- vpmovzxwd(xmmword [base + index*2 + disp32])  (mod=10 SIB)
+	void vpmovzxwd_ymm_load_basex2_disp32(ymm dst, gpr base, gpr index, int32_t disp);
+
+	// ymm dst <- vpslld(ymm src, imm8)   (logical shift left, 32-bit lanes)
+	void vpslld_ymm_imm8(ymm dst, ymm src, uint8_t imm);
+
 	// xmm dst <- ymm src lane (0 = low, 1 = high)
 	void vextractf128_xmm_ymm(ymm dst_xmm, ymm src_ymm, uint8_t lane);
 
 	void vaddps_xmm(ymm dst, ymm a, ymm b);
 	void vaddps_ymm(ymm dst, ymm a, ymm b);
 	void vhaddps_xmm(ymm dst, ymm a, ymm b);
+	void vhaddps_ymm(ymm dst, ymm a, ymm b);
 
 	// [base + index*4]  <-  xmm src lane 0  (32-bit store)
 	void vmovss_store_basex4(gpr base, gpr index, ymm src_xmm);
+
+	// [base + index*4]  <-  xmm src (128-bit / 16-byte unaligned store)
+	void vmovups_xmm_store_basex4(gpr base, gpr index, ymm src_xmm);
 
 	void vzeroupper();
 
