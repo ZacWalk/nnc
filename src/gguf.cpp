@@ -3,14 +3,13 @@
 #include "gguf.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include <vector>
 
 namespace
 {
@@ -365,6 +364,15 @@ namespace
 		case 7: return {24, 32}; // Q5_1
 		case 8: return {34, 32}; // Q8_0
 		case 9: return {40, 32}; // Q8_1
+		// K-quants (block size = 256 elements). Sizes match ggml's
+		// `block_q*_k` structs and are exercised by the --inspect-model
+		// path for byte accounting only — nnc does not yet load these.
+		case 10: return {84, 256}; // Q2_K
+		case 11: return {110, 256}; // Q3_K
+		case 12: return {144, 256}; // Q4_K
+		case 13: return {176, 256}; // Q5_K
+		case 14: return {210, 256}; // Q6_K
+		case 15: return {292, 256}; // Q8_K
 		case 24: return {1, 1}; // I8
 		case 25: return {2, 1}; // I16
 		case 26: return {4, 1}; // I32
@@ -409,74 +417,42 @@ bool gguf_mmap(const std::string& path, gguf_file& out)
 {
 	if (!gguf_load(path, out)) return false;
 
-	// Convert UTF-8 path to wide for CreateFileW.
-	const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-	std::vector<wchar_t> wpath(wlen > 0 ? wlen : 1);
-	if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+	if (!sys_mmap_file_ro(path.c_str(), out.mapping))
+	{
+		return false;
+	}
+	out.mapped_base = static_cast<const uint8_t*>(out.mapping.base);
+	out.mapped_size = out.mapping.size;
 
-	const HANDLE hFile = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-	                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-	                                 nullptr);
-	if (hFile == INVALID_HANDLE_VALUE)
-	{
-		fprintf(stderr, "gguf: CreateFileW failed for '%s' (err=%lu)\n",
-		        path.c_str(), GetLastError());
-		return false;
-	}
-	LARGE_INTEGER sz{};
-	if (!GetFileSizeEx(hFile, &sz))
-	{
-		CloseHandle(hFile);
-		fprintf(stderr, "gguf: GetFileSizeEx failed (err=%lu)\n", GetLastError());
-		return false;
-	}
-	const HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-	if (!hMap)
-	{
-		CloseHandle(hFile);
-		fprintf(stderr, "gguf: CreateFileMappingW failed (err=%lu)\n", GetLastError());
-		return false;
-	}
-	const void* base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-	if (!base)
-	{
-		CloseHandle(hMap);
-		CloseHandle(hFile);
-		fprintf(stderr, "gguf: MapViewOfFile failed (err=%lu)\n", GetLastError());
-		return false;
-	}
-	out.file_handle = hFile;
-	out.mapping_handle = hMap;
-	out.mapped_base = static_cast<const uint8_t*>(base);
-	out.mapped_size = static_cast<uint64_t>(sz.QuadPart);
+	// Hint the OS to start prefetching the entire mapping into RAM.
+	// Best-effort; ignored on failure.
+	sys_prefetch_ro(out.mapping.base, out.mapping.size);
+
 	return true;
 }
 
 void gguf_unmap(gguf_file& out)
 {
-	if (out.mapped_base)
-	{
-		UnmapViewOfFile(out.mapped_base);
-		out.mapped_base = nullptr;
-	}
-	if (out.mapping_handle)
-	{
-		CloseHandle(out.mapping_handle);
-		out.mapping_handle = nullptr;
-	}
-	if (out.file_handle)
-	{
-		CloseHandle(out.file_handle);
-		out.file_handle = nullptr;
-	}
+	sys_munmap(out.mapping);
+	out.mapped_base = nullptr;
 	out.mapped_size = 0;
 }
 
 const void* gguf_tensor_data(const gguf_file& f, const size_t i)
 {
 	if (!f.mapped_base || i >= f.tensors.size()) return nullptr;
-	const uint64_t off = f.data_offset + f.tensors[i].offset;
+	const uint64_t rel = f.tensors[i].offset;
+	// Guard against overflow on data_offset + rel before bounds-checking
+	// against mapped_size; a malformed file can otherwise wrap to a
+	// small offset and pass the >= mapped_size test.
+	if (rel > UINT64_MAX - f.data_offset) return nullptr;
+	const uint64_t off = f.data_offset + rel;
 	if (off >= f.mapped_size) return nullptr;
+	// Validate the entire payload fits within the mapping. A malformed
+	// GGUF can specify a small offset with a huge tensor and otherwise
+	// hand back a pointer whose tail walks past the mmap.
+	const uint64_t nbytes = gguf_tensor_nbytes(f.tensors[i]);
+	if (nbytes > f.mapped_size - off) return nullptr;
 	return f.mapped_base + off;
 }
 

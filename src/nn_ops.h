@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // y[i] = 0.5 * x[i] * (1 + tanh( sqrt(2/pi) * (x[i] + 0.044715 * x[i]^3) ))
@@ -24,6 +25,23 @@ float nnc_dot_f16_to_f32(const void* x, const void* y, size_t n);
 // -INFINITY entries map to 0 (used for causal attention masks).
 void nnc_softmax_f32_inplace(float* p, size_t n);
 
+// Fused per-head attention softmax + V matmul:
+//   m = max_t scores[t]
+//   w_t = exp(scores[t] - m)         (in place into `scores`)
+//   S = sum_t w_t
+//   out[i] = (sum_t w_t * V[t * v_stride + i]) / S        for i in [0, head_dim)
+//
+// Equivalent to:
+//   nnc_softmax_f32_inplace(scores, n_t);
+//   memset(out, 0, head_dim * sizeof(float));
+//   for (t) for (i) out[i] += scores[t] * V[t*v_stride + i];
+// but in a single pass over `scores`: avoids the second read of the
+// softmax output (n_t * 4 bytes per head per layer per token) and the
+// initial zero of `out`. `V` is laid out as `n_t` rows of `v_stride`
+// floats with the head's V vector at offset 0 of each row.
+void nnc_attn_softmax_v_f32(float* out, float* scores, const float* V,
+                            size_t n_t, size_t v_stride, size_t head_dim);
+
 // LayerNorm over n contiguous floats (mean 0, variance 1, then optional
 // affine is applied by a separate op
 //   m  = mean(x); v = mean((x-m)^2);  y[i] = (x[i] - m) / sqrt(v + eps).
@@ -35,6 +53,20 @@ void nnc_layernorm_f32(float* y, const float* x, size_t n, float eps);
 // y and x may alias. Used by Gemma / Llama-style models. The (optional)
 // per-channel learned scale is applied by the caller.
 void nnc_rmsnorm_f32(float* y, const float* x, size_t n, float eps);
+
+// Apply (RMSNorm + per-channel gamma multiply) to `n_groups` contiguous
+// length-`dim` vectors. Equivalent to:
+//   for (g) { rmsnorm(y+g*dim, x+g*dim, dim); for (i) y[g*dim+i] *= gamma[i]; }
+// but the gamma vector stays hot in L1 across all groups.
+void nnc_rmsnorm_gamma_multi_f32(float* y, const float* x,
+                                 size_t n_groups, size_t dim,
+                                 const float* gamma, float eps);
+
+// AVX2 / FMA dot product of two FP32 vectors. 4-accumulator unroll for
+// 8*4 = 32-element strides; tail handled scalarly. Intended for the
+// per-head attention Q.K dot (head_dim=256 / 512), where the JITed
+// dot_f32 kernel's call overhead would dominate.
+float nnc_dot_f32_simd(const float* a, const float* b, size_t n);
 
 // Fused FP16-weights, FP32-activations gemv:
 //   y[r] = sum_{k=0..cols-1} fp16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
@@ -67,6 +99,46 @@ void nnc_gemv_bf16w_f32x(const void* W, const float* x, float* y,
 int nnc_gemv_bf16w_argmax_f32x(const void* W, const float* x,
                                uint32_t rows, uint32_t cols);
 
+// Q8_0 split-layout gemv: y[r] = sum_b scales[r,b] * sum_{k in block b} qs[r,k]*x[k]
+// for r in [0, rows). qs is row-major int8 of size rows*cols; scales is
+// row-major fp32 of size rows*(cols/32). cols must be a positive multiple
+// of 32. Routes to a JIT 1-row kernel (cols baked) and parallelises the
+// row axis through the same worker pool as the BF16 path when rows is
+// large enough to amortise dispatch.
+void nnc_gemv_q8_0_f32x(const int8_t* qs, const float* scales,
+                        const float* x, float* y,
+                        uint32_t rows, uint32_t cols);
+
+// In-place quantize a row-major BF16 weight matrix [rows x cols] into the
+// Q8_0 split layout: writes `qs[rows*cols]` (int8) followed by
+// `scales[rows*(cols/32)]` (fp32). cols must be a positive multiple of 32.
+// Uses absmax-per-block scaling: scale = max(|w|)/127, q = round(w/scale).
+void nnc_quantize_bf16_to_q8_0(const uint16_t* W_bf16, int8_t* qs,
+                               float* scales, size_t rows, size_t cols);
+
+// ---- K-quant dequantizers ---------------------------------------------
+//
+// All three layouts use a 256-element super-block with fp16 super-scales
+// and 6-bit (Q4_K/Q5_K) or 8-bit (Q6_K) per-sub-block scales. Block
+// sizes (matching ggml `block_q*_K`):
+//   Q4_K = 144 bytes  ( 256 elems, 4-bit qs)
+//   Q5_K = 176 bytes  ( 256 elems, 4-bit qs + 1-bit qh)
+//   Q6_K = 210 bytes  ( 256 elems, 4-bit ql + 2-bit qh + i8 scales)
+//
+// `n_elements` must be a positive multiple of 256. `blocks` points at
+// the first packed block; `dst` receives `n_elements` contiguous
+// floats. Scalar reference implementations (no SIMD yet); used at load
+// time to dequant K-quant weights into a denser format that the
+// existing BF16 / Q8_0 gemv kernels can consume.
+void nnc_dequantize_q4_k_to_f32(const void* blocks, float* dst, size_t n_elements);
+void nnc_dequantize_q5_k_to_f32(const void* blocks, float* dst, size_t n_elements);
+void nnc_dequantize_q6_k_to_f32(const void* blocks, float* dst, size_t n_elements);
+
+// Dispatch by the GGUF / ggml type code (12=Q4_K, 13=Q5_K, 14=Q6_K).
+// Returns false (and leaves dst untouched) for unsupported types.
+bool nnc_dequantize_kquant_to_f32(uint32_t ggml_type, const void* blocks,
+                                  float* dst, size_t n_elements);
+
 // Fused SwiGLU activation used by Gemma / Llama MLPs:
 //   y[i] = silu(gate[i]) * up[i]   where silu(x) = x * sigmoid(x).
 // y may alias gate or up.
@@ -79,6 +151,13 @@ void nnc_add_inplace_f32(float* y, const float* b, size_t n);
 // a learned per-channel scale (e.g. Gemma's RMSNorm gamma) right after
 // nnc_rmsnorm_f32.
 void nnc_mul_inplace_f32(float* y, const float* s, size_t n);
+
+// Fused gated-MLP activation:  y[i] = gelu(gate[i]) * up[i].
+// Replaces a two-pass `nnc_gelu_f32(gate); nnc_mul_inplace_f32(gate, up)`
+// pair, halving memory traffic on `gate` (one read + one write instead
+// of two of each). Matches the Gemma 4 "FFN_GELU + PAR" inner step.
+// `y` may alias `gate` or `up`.
+void nnc_gelu_mul_f32(float* y, const float* gate, const float* up, size_t n);
 
 // Rotary position embedding (NeoX/half-pair convention used by Gemma /
 // Llama / Mistral). For one token at position `pos`, applies an in-place
@@ -93,7 +172,7 @@ void nnc_mul_inplace_f32(float* y, const float* s, size_t n);
 // theta base (Gemma uses 1e6 for global layers, 1e4 for sliding-window
 // layers).
 void nnc_rope_f32(float* x, uint32_t n_heads, uint32_t head_dim,
-                  uint32_t n_rot, int32_t pos, float freq_base);
+                  uint32_t n_rot, float pos, float freq_base);
 
 // Logit soft-cap (Gemma final-layer & some attention-layer outputs):
 //   y[i] = tanh(x[i] / cap) * cap.

@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "sys.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -70,21 +72,20 @@ struct gguf_file
 	std::vector<gguf_kv> kv;
 	std::vector<gguf_tensor_info> tensors;
 
-	// Set by gguf_mmap(); zero/nullptr if only gguf_load() was used.
-	void* mapping_handle = nullptr; // HANDLE from CreateFileMappingW
-	void* file_handle = nullptr; // HANDLE from CreateFileW
-	const uint8_t* mapped_base = nullptr; // start of mmapped region
-	uint64_t mapped_size = 0;
+	// Set by gguf_mmap(); zero/null if only gguf_load() was used.
+	sys_mmap mapping{};
+	const uint8_t* mapped_base = nullptr; // == mapping.base, kept for convenience
+	uint64_t mapped_size = 0; // == mapping.size
 };
 
 // Parse the GGUF header + KV table + tensor descriptors. Tensor *data*
 // is not read. Returns true on success; on failure prints to stderr.
 bool gguf_load(const std::string& path, gguf_file& out);
 
-// Open the file via Win32 CreateFileMapping/MapViewOfFile and parse the
-// header into `out`. The mapped region remains valid until
-// gguf_unmap(). After this returns, gguf_tensor_data(out, i) yields a
-// pointer into the mapped tensor data block.
+// mmap the file read-only and parse the header into `out`. The mapped
+// region remains valid until gguf_unmap(). After this returns,
+// gguf_tensor_data(out, i) yields a pointer into the mapped tensor data
+// block.
 bool gguf_mmap(const std::string& path, gguf_file& out);
 void gguf_unmap(gguf_file& out);
 

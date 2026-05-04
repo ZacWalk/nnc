@@ -131,3 +131,43 @@ void x64_emitter::ret()
 {
 	buf_.emit_u8(0xC3);
 }
+
+void x64_emitter::emit_win64_arg_shuffle(const int n_int_args)
+{
+#if defined(_WIN32)
+	(void)n_int_args; // Win64 host: kernel ABI already matches.
+#else
+	// SysV→Win64 int-arg mapping:
+	//   rdi -> rcx,  rsi -> rdx,  rdx -> r8,  rcx -> r9
+	// Emit in reverse so we don't clobber rdx/rcx before reading them.
+	assert(n_int_args >= 0 && n_int_args <= 4);
+	if (n_int_args >= 4)
+	{
+		// mov r9, rcx   : REX.WB(49) 89 /r  ModRM 11 001 001 (C9)
+		buf_.emit_u8(0x49);
+		buf_.emit_u8(0x89);
+		buf_.emit_u8(0xC9);
+	}
+	if (n_int_args >= 3)
+	{
+		// mov r8, rdx   : 49 89 D0
+		buf_.emit_u8(0x49);
+		buf_.emit_u8(0x89);
+		buf_.emit_u8(0xD0);
+	}
+	if (n_int_args >= 2)
+	{
+		// mov rdx, rsi  : 48 89 F2
+		buf_.emit_u8(0x48);
+		buf_.emit_u8(0x89);
+		buf_.emit_u8(0xF2);
+	}
+	if (n_int_args >= 1)
+	{
+		// mov rcx, rdi  : 48 89 F9
+		buf_.emit_u8(0x48);
+		buf_.emit_u8(0x89);
+		buf_.emit_u8(0xF9);
+	}
+#endif
+}

@@ -1,6 +1,11 @@
 // nnc — executable-memory allocator.
-// Reserve+commit pages with VirtualAlloc as RW, append bytes, then flip to
-// PAGE_EXECUTE_READ via VirtualProtect and FlushInstructionCache.
+//
+// Backed by a process-wide bump-allocator pool of large RWX pages
+// (jit_code_pool, internal). Each `commit()` copies the staged bytes
+// into the next 16-byte-aligned slot of the active page (allocating a
+// fresh page if it doesn't fit) and returns a pointer to executable
+// code. `jit_buffer` itself only owns the staging vector; pool pages
+// are process-lifetime and never freed.
 
 #pragma once
 
@@ -25,16 +30,12 @@ public:
 	size_t size() const { return staging_.size(); }
 	const uint8_t* staging_data() const { return staging_.data(); }
 
-	// Commit staging to a fresh executable page and return a pointer to the
-	// start of the code. Subsequent calls to commit() allocate a new page;
-	// the previously-returned pointer is invalidated when this jit_buffer
-	// dies (or commit() is called again).
+	// Copy the staging bytes into the shared executable-page pool and
+	// return a pointer to the start of the placed code. Subsequent
+	// commit() calls install into a fresh slot; previously-returned
+	// pointers remain valid for the lifetime of the process.
 	void* commit();
 
 private:
-	void release();
-
 	std::vector<uint8_t> staging_;
-	void* exec_ = nullptr;
-	size_t exec_size_ = 0;
 };

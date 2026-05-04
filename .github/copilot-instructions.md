@@ -4,8 +4,8 @@
 
 - **Name:** `nnc` (neural net compiler). Use this name in all new docs, comments, log prefixes, CLI help text, and identifiers.
 - **Legacy name:** `ml-cpu` — fully retired. The repo folder still happens to be named `ml-cpu` but no project, file, or identifier uses it.
-- **Executable:** one binary, `nnc.exe` (Debug: `nnc-d.exe`). No second exe for tests, no second exe for tooling.
-- **Platform:** Windows x64 only. MSVC (v145+), C++20, C17.
+- **Executable:** one binary, `nnc.exe` (Debug: `nnc-d.exe`) on Windows; `nnc` / `nnc-d` on Linux. No second exe for tests, no second exe for tooling.
+- **Platforms:** Windows x64 (MSVC v145+) and Linux x64 (g++ 10+ / clang++ 12+, including WSL2). C++20, C17.
 - **CPU baseline:** AVX2 + FMA + F16C. Do **not** use AVX-512 intrinsics or codegen. Detect AVX2/FMA at startup; refuse to run on older CPUs.
 
 ## What nnc is
@@ -18,6 +18,7 @@ Keep the layout **flat**. Do not create subfolders under `src/` (no `src/jit/`, 
 
 ```
 nnc.sln
+Makefile                     Linux build (release/debug/test/clean)
 src/
   nnc.vcxproj
   main.cpp                   CLI entry, argument dispatch, Gemma REPL driver
@@ -26,29 +27,41 @@ src/
   utils.cpp / utils.h        CLI parsing
   gguf.cpp / gguf.h          GGUF v2/v3 parser + mmap loader
   gemma.cpp / gemma.h        Gemma 3n loader, tokenizer, KV cache, forward
-  jit_buffer.cpp/.h          executable-memory allocator (VirtualAlloc + VirtualProtect)
-  emitter_x64.cpp/.h         raw byte / REX / ModR/M / SIB encoding helpers
+  jit_buffer.cpp/.h          executable-memory allocator (W^X via the sys layer)
+  emitter_x64.cpp/.h         raw byte / REX / ModR/M / SIB encoding helpers + SysV→Win64 ABI shim
   emitter_avx2.cpp/.h        VEX-encoded AVX2 + FMA + F16C instructions we use
   jit_kernel.cpp/.h          typed function-pointer wrappers, CPU detection, kernel cache
   jit_ops.cpp/.h             high-level kernel builders (dot, gemv, ...)
+  sys.h                      OS abstraction (console, exec pages, mmap, CPUID)
+  sys_win.cpp                Windows impl of sys.h (#if defined(_WIN32))
+  sys_linux.cpp              Linux/POSIX impl of sys.h (#if !defined(_WIN32))
   tests.cpp                  ALL tests live here (app + jit). Single TU.
 models/                      Gemma 3n weight files (.gguf)
-exe/                         build output (nnc.exe, nnc-d.exe)
+exe/                         build output (nnc(.exe), nnc-d(.exe))
 ```
+
+**OS isolation rule:** no `windows.h`, `<intrin.h>`, `<sys/mman.h>`,
+`<unistd.h>` etc. outside `sys_win.cpp` / `sys_linux.cpp`. New OS
+functionality goes through a new `sys_*` function declared in `sys.h`
+and implemented in both backends.
 
 ## CLI conventions
 
 One executable, mode chosen by argv. The default model path is
 `models\gemma-4-E2B-it-BF16.gguf`; bare `nnc` (with no `-m`) opens the chat
-REPL on that file.
+REPL on that file. **Q8_0 weight quantization is on by default** — the dominant
+weight tensors are quantized in place after `gemma_load`. Pass `--bf16` to
+keep weights as raw BF16.
 
 - `nnc` — load the default Gemma model and start the interactive chat REPL.
 - `nnc -m <file.gguf>` — same, but with a different Gemma 3n GGUF.
+- `nnc --bf16` (also `-bf16`) — disable Q8_0 quantization for this run.
+- `nnc --q8` (also `-q8`) — explicit Q8_0; redundant since it's the default but accepted for back-compat.
 - `nnc --test` (also `-test`, `/test`) — runs every test in `tests.cpp` and exits with non-zero on failure. Tests must be silent on success beyond a final summary line.
 - `nnc --gguf-info <file>`, `--gguf-stats`, `--gemma-info`, `--gemma-probe`, `--gemma-forward`, `--gemma-tokenize`, `--gemma-prompt`, `--gemma-gen` — inspection / smoke-test modes.
 - Existing flags from `utils.cpp` (`-s`, `--top_k`, `--top_p`, `--temp`, `-b`, `-n`) keep their names. `-n` controls max tokens generated per REPL turn (default 256). The sampling flags (`--top_k`, `--top_p`, `--temp`) are parsed but currently unused — the REPL uses argmax (greedy) decode.
 
-Argument parsing lives in `utils.cpp::gpt_params_parse`. New flags get added there, not in `main.cpp`.
+Global flag parsing for `--bf16` / `--q8` lives in `main.cpp` (pre-scan before any subcommand dispatch). The `maybe_quantize` lambda is invoked after every `gemma_load(...)` call site. New flags from `utils.cpp::gpt_params_parse` get added there; truly global flags (that gate behaviour across all modes) get added to the `main.cpp` pre-scan.
 
 ### Chat REPL specifics (`main.cpp`)
 
@@ -67,19 +80,21 @@ Argument parsing lives in `utils.cpp::gpt_params_parse`. New flags get added the
 - JIT numerical tests compare against a scalar reference within a relative tolerance (start at `1e-4`); FMA rounding will differ from naive scalar order — that is expected, not a bug.
 - Tests must not require model files. Generate synthetic inputs.
 
-Current test count: **19 tests, all passing**.
+Current test count: **22 tests, all passing**.
 
 ## Runtime (`runtime.cpp` / `runtime.h`)
 
 - Arena allocator (`nnc_init` / `nnc_free`) — bump-pointer over a single mem buffer; no per-tensor frees.
-- Tensor: `type` (F32 / F16 / I32 / BF16), `n_dims`, `ne[4]`, `nb[4]`, `op`, `src0/src1`, `data`, `op_params[4]`. Gemma weights are BF16; activations and norms are F32.
+- Tensor: `type` (F32 / F16 / I32 / BF16 / **Q8_0**), `n_dims`, `ne[4]`, `nb[4]`, `op`, `src0/src1`, `data`, `op_params[4]`. Gemma weights start out BF16; with quantization on they become Q8_0 in place. Activations and norms are F32.
+- **Q8_0 layout (in-house, not standard ggml):** a single allocation per tensor holds `int8 qs[rows*cols]` followed by `float scales[rows*cols/32]` (one fp32 scale per 32-element block, row-major). `tensor->data` points at `qs`; the scales pointer is `(float*)((uint8_t*)data + rows*cols)`. The owning `std::unique_ptr<uint8_t[]>` lives in `gemma_file::q8_buffers`; the original mmapped BF16 bytes are left mapped (OS may page them out). Quantize: `scale = absmax/127`, `q = round(w/scale)` clamped to `[-127, 127]`. Cost: scales are fp32 not fp16 — 1.78× BW reduction vs theoretical 1.88× for standard interleaved Q8_0.
 - Op enum and graph (`nnc_cgraph`, `NNC_MAX_NODES = 4096`). Build via `nnc_build_forward_expand` (DFS topo).
 - `nnc_graph_compute` first calls `nnc_graph_prefuse` (in `nn_ops.cpp`) to identify `mul_mat → repeat(bias) → add [→ gelu]` patterns and mutate skipped nodes' `op` to `NNC_OP_NONE`. Then dispatches each node.
 - VIEW / RESHAPE / PERMUTE / TRANSPOSE are no-ops at compute time: their result tensors share the source's `data` pointer and carry adjusted `ne`/`nb`. Permute semantics: `result->ne[axes[i]] = src->ne[i]` (axes specify destination slot). CPY is a logical row-major flatten into the destination's contiguous buffer.
+- **`token_embd` is intentionally never quantized** — it doubles as the input embedding table (read row-wise via `nnc_embed_row_bf16`) and the lm_head projection. Flipping its type would corrupt the embedding lookup. Dispatch in `gemma.cpp::gw_gemv` / `gw_argmax` branches on `T->type`.
 
 ## JIT design rules
 
-- **ABI:** Windows x64 only. Document register usage at the top of each kernel builder. Prefer volatile registers (RAX, RCX, RDX, R8–R11, XMM0–XMM5). The existing gemv builders save and restore RSI/RDI when they need extra GPRs — follow the same pattern (push rsi/rdi, no extra `sub rsp`).
+- **ABI:** kernels are written assuming Windows x64 (int args in RCX, RDX, R8, R9). On Linux, every kernel builder calls `x64_emitter::emit_win64_arg_shuffle(n_int_args)` as its first instruction — this emits the SysV→Win64 register moves on Linux and is a no-op on Windows. Document register usage at the top of each kernel builder. Prefer volatile registers (RAX, RCX, RDX, R8–R11, XMM0–XMM5). The existing gemv builders save and restore RSI/RDI when they need extra GPRs — follow the same pattern (push rsi/rdi, no extra `sub rsp`).
 - **`vzeroupper` before every `ret`.** Non-negotiable. Otherwise the caller's SSE code stalls.
 - **No third-party JIT libs.** No AsmJit, no xbyak, no LLVM. Hand-rolled encoders only (`emitter_x64.cpp`, `emitter_avx2.cpp`).
 - **Kernel cache:** `jit_kernel_cache` in `jit_kernel.cpp` holds one `std::unordered_map<uint64_t, entry>` per kernel family, keyed on `pack(rows, cols)`. JIT once on first use, reuse forever. Lock with `global_cache_mutex()` (in `nn_ops.cpp`) when constructing.
@@ -89,15 +104,22 @@ Current test count: **19 tests, all passing**.
 
 ## Implementation status
 
-Stages 0–5 from the original roadmap are complete plus a BF16-weight JIT path: cleanup done, JIT foundations in place, FP32 dot/gemv kernels, FP16-W/FP32-x gemv with bias-add and GELU fusion, **BF16-W/FP32-x gemv** (`nnc_build_gemv_bf16w_f32x` in `jit_ops.cpp`, encoded with `vpmovzxwd` + `vpslld 16` + 4-accumulator FMA unroll when `cols % 32 == 0`), plus SIMD softmax, layernorm/RMSNorm, RoPE, soft-cap, SwiGLU. Every Q/K/V/O, gate/up/down, PLE inp_gate/proj, and the final logits gemv in Gemma now JITs through the BF16 cache. The historical `ggml.*` and intermediate `nnc.cpp/.h` ports, the legacy GPT-2 `.bin` loader, and the JSON/BPE tokenizer are all gone. The runtime is Gemma 3n GGUF only.
+Stages 0–5 from the original roadmap are complete plus BF16- and Q8_0-weight JIT paths: cleanup done, JIT foundations in place, FP32 dot/gemv kernels, FP16-W/FP32-x gemv with bias-add and GELU fusion, **BF16-W/FP32-x gemv** (`nnc_build_gemv_bf16w_f32x` in `jit_ops.cpp`, encoded with `vpmovzxwd` + `vpslld 16` + 4-accumulator FMA unroll when `cols % 32 == 0`, plus a 4-row variant with shared x-tile when `rows % 4 == 0`), **Q8_0-W/FP32-x gemv** (`nnc_build_gemv_q8_0_f32x_1row` in `jit_ops.cpp`, single-row, 32-element blocks, `vbroadcastss` scale + `vpmovsxbd` 8 × i8→i32 + `vcvtdq2ps` + `vmulps` + `vfmadd231ps`), plus SIMD softmax, layernorm/RMSNorm, RoPE, soft-cap, SwiGLU. A static worker pool (default 8 workers + main, `NNC_THREADS` override) parallelises every weight gemv with `rows >= 256 && cols >= 256` along the row axis. Every Q/K/V/O, gate/up/down, PLE inp_gate/proj, and the final logits gemv in Gemma routes through `gemma.cpp::gw_gemv` / `gw_argmax`, which pick the BF16 or Q8_0 kernel based on `tensor->type`. The historical `ggml.*` and intermediate `nnc.cpp/.h` ports, the legacy GPT-2 `.bin` loader, and the JSON/BPE tokenizer are all gone. The runtime is Gemma 3n GGUF only.
 
-Released perf reference (E2B, recent desktop CPU): decode ≈ 220 ms/tok with the JIT, vs ≈ 267 ms/tok using the equivalent intrinsic loop — roughly a 1.2× speedup. Memory bandwidth on the BF16 weights dominates the remaining cost.
+Measured perf (E2B Release, synthetic 8-tok prompt + 64-tok decode, 3-run avg):
 
-Next areas of work: per-head fixed-shape attention kernels, more aggressive fusion (e.g. fused gate*up*silu + down for the FFN), and further Release-build perf tuning.
+| weight dtype | prefill (ms/tok) | decode (ms/tok) | weight RAM |
+| --- | --- | --- | --- |
+| BF16 (`--bf16`) | 180.5 | 72.8 | 3615.8 MB |
+| Q8_0 (default)  | 113.8 | 49.5 | 2033.9 MB |
+
+Decode is DRAM-BW bound; the BF16 path plateaus by ~4 threads. Q8_0 cuts per-token weight reads ~1.78× and recovers most of that as latency. Remaining gap is the lm_head + input embedding (both share `token_embd`, which stays BF16).
+
+Next areas of work: per-head fixed-shape attention kernels, more aggressive fusion (e.g. fused gate*up*silu + down for the FFN), Q4_K for further BW reduction.
 
 ## Build & run (reference)
 
-MSBuild via `vswhere`:
+### Windows (MSBuild via `vswhere`)
 
 ```powershell
 $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
@@ -105,24 +127,29 @@ $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere
 & $msbuild nnc.sln /p:Configuration=Debug /p:Platform=x64 /m /v:minimal /nologo
 ```
 
-Smoke run (uses the default model path automatically):
+Smoke run / tests:
 
 ```powershell
 .\exe\nnc-d.exe
+.\exe\nnc-d.exe --test
 ```
 
-Tests:
+### Linux / WSL
 
-```powershell
-.\exe\nnc-d.exe --test
+```bash
+make debug          # -> exe/nnc-d
+make                # release -> exe/nnc
+make test           # build debug + run --test
+./exe/nnc-d --test
 ```
 
 ## House style
 
 - C++20, exceptions allowed but not used in hot paths.
-- **Asserts:** use `NNC_ASSERT(expr)` from `runtime.h`. It prints `nnc: ASSERT failed: <expr> at <file>:<line>` to stderr and `_exit`s — no modal message box. Plain `assert(...)` is acceptable inside the emitters for build-time invariants but `NNC_ASSERT` is preferred in any new runtime / op code.
+- **Asserts:** use `NNC_ASSERT(expr)` from `runtime.h`. It prints `nnc: ASSERT failed: <expr> at <file>:<line>` to stderr and exits via `std::_Exit` — no modal message box. Plain `assert(...)` is acceptable inside the emitters for build-time invariants but `NNC_ASSERT` is preferred in any new runtime / op code.
 - Tabs for indentation in existing files (matches current code); do not reformat unrelated lines.
 - New files: same brace style as `main.cpp` (Allman, tabs).
-- No new dependencies without an explicit ask. The project must build with only MSVC + the Windows SDK.
+- No new dependencies without an explicit ask. The project must build with only MSVC + the Windows SDK on Windows, and only g++/clang + libstdc++ on Linux.
 - Do not add docstrings, comments, or refactors to code you are not otherwise changing.
 - When concatenating C/C++ files on Windows, strip any 0x1A (Ctrl+Z) bytes — MSVC treats them as EOF in text mode.
+- Standard-library portability: explicitly include `<cstddef>` for `size_t`, `<cstring>` for `memcpy`/`memset`, `<cmath>` for math — don't rely on transitive includes that happen to work on MSVC.

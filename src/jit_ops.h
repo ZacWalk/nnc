@@ -56,3 +56,16 @@ void nnc_build_gemv_bf16w_f32x(jit_buffer& buf, uint32_t rows, uint32_t cols);
 //
 // Requires rows > 0 and rows % 4 == 0, cols > 0 and cols % 8 == 0.
 void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, uint32_t rows, uint32_t cols);
+
+// Emits a single-row Q8_0 dot-product kernel:
+//   void gemv_q8_0_1row(const int8_t* qs, const float* x,
+//                       float* y_out, const float* scales);
+// Computes  *y_out = sum_b scales[b] * sum_{k in block b} qs[b*32+k] * x[b*32+k]
+// and writes it to *y_out. cols must be a positive multiple of 32. The
+// caller (worker pool) iterates rows externally, advancing qs by `cols`
+// bytes, scales by `(cols/32)*4` bytes, and y by 4 bytes per row. Inner
+// loop processes one Q8_0 block (32 cols) per iteration with 4 unrolled
+// 8-col FMA steps.
+//
+// Win64 ABI: rcx=qs, rdx=x, r8=y_out, r9=scales. Saves rsi+rdi.
+void nnc_build_gemv_q8_0_f32x_1row(jit_buffer& buf, uint32_t cols);

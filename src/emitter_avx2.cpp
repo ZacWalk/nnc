@@ -101,6 +101,25 @@ void avx2_emitter::vfmadd231ps_ymm_mem_basex4(ymm acc, ymm a, gpr base, gpr inde
 	buf_.emit_u8(sib(0b10, ix, bs));
 }
 
+// ----- VEX.DDS.256.66.0F38.W0 B8 /r : VFMADD231PS ymm, ymm, [base+ix*4+disp8]
+void avx2_emitter::vfmadd231ps_ymm_mem_basex4_disp8(ymm acc, ymm a, gpr base, gpr index, const int8_t disp)
+{
+	const uint8_t d = static_cast<uint8_t>(acc);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && s1 < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     vex_inv_vvvv(s1), 1, 0b01);
+	buf_.emit_u8(0xB8);
+	buf_.emit_u8(modrm(0b01, d, 0b100));
+	buf_.emit_u8(sib(0b10, ix, bs));
+	buf_.emit_u8(static_cast<uint8_t>(disp));
+}
+
 // ----- VEX.DDS.256.66.0F38.W0 B8 /r : VFMADD231PS ymm, ymm, ymm ---------
 void avx2_emitter::vfmadd231ps_ymm_ymm_ymm(ymm acc, ymm a, ymm b)
 {
@@ -222,6 +241,86 @@ void avx2_emitter::vpmovzxwd_ymm_load_basex2_disp32(ymm dst, gpr base, gpr index
 	buf_.emit_u8(modrm(0b10, d, 0b100));
 	buf_.emit_u8(sib(0b01, ix, bs));
 	buf_.emit_u32(static_cast<uint32_t>(disp));
+}
+
+// ----- VEX.256.66.0F38.W0 21 /r : VPMOVSXBD ymm, m64 (SIB index*1) -------
+// 8 packed signed bytes in [base + index] -> 8 sign-extended dwords in ymm.
+void avx2_emitter::vpmovsxbd_ymm_load_basex1(ymm dst, gpr base, gpr index)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8 form; not implemented");
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x21);
+	buf_.emit_u8(modrm(0b00, d, 0b100)); // SIB follows
+	buf_.emit_u8(sib(0b00, ix, bs)); // scale = *1
+}
+
+// ----- VPMOVSXBD ymm, [base + index + disp8] -----------------------------
+void avx2_emitter::vpmovsxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index, const int8_t disp)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x21);
+	buf_.emit_u8(modrm(0b01, d, 0b100));
+	buf_.emit_u8(sib(0b00, ix, bs));
+	buf_.emit_u8(static_cast<uint8_t>(disp));
+}
+
+// ----- VEX.256.66.0F38.W0 18 /r : VBROADCASTSS ymm, m32 -----------------
+// Loads one f32 from [base] and broadcasts to all 8 lanes.
+void avx2_emitter::vbroadcastss_ymm_load_base(ymm dst, gpr base)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	assert(d < 8 && bs < 8);
+	assert((bs & 7) != 4 && "base = RSP/R12 needs SIB; not implemented");
+	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8; not implemented");
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x18);
+	buf_.emit_u8(modrm(0b00, d, bs));
+}
+
+// ----- VEX.256.0F.WIG 5B /r : VCVTDQ2PS ymm, ymm ------------------------
+// 8 packed signed dwords -> 8 packed single-precision floats.
+void avx2_emitter::vcvtdq2ps_ymm_ymm(ymm dst, ymm src)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t s = static_cast<uint8_t>(src);
+	assert(d < 8 && s < 8);
+
+	vex2(vex_inv_high(d), 0xF, 1, 0); // L=1 (256), pp=none
+	buf_.emit_u8(0x5B);
+	buf_.emit_u8(modrm(0b11, d, s));
+}
+
+// ----- VEX.NDS.256.0F.WIG 59 /r : VMULPS ymm, ymm, ymm ------------------
+void avx2_emitter::vmulps_ymm_ymm_ymm(ymm dst, ymm a, ymm b)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t s2 = static_cast<uint8_t>(b);
+	assert(d < 8 && s1 < 8 && s2 < 8);
+
+	vex2(vex_inv_high(d), vex_inv_vvvv(s1), 1, 0); // L=1, pp=none
+	buf_.emit_u8(0x59);
+	buf_.emit_u8(modrm(0b11, d, s2));
 }
 
 // ----- VEX.NDS.256.66.0F.WIG 72 /6 ib : VPSLLD ymm, ymm, imm8 -----------

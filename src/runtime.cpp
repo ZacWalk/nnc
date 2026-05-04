@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <immintrin.h>
 
 #define NNC_MEM_ALIGN 16
@@ -22,7 +23,7 @@
 {
 	fprintf(stderr, "\nnnc: ASSERT failed: %s\n  at %s:%d\n", expr, file, line);
 	fflush(stderr);
-	_exit(3);
+	std::_Exit(3);
 }
 
 // ============================================================================
@@ -58,6 +59,11 @@ static constexpr nnc_type_info g_type_info[NNC_TYPE_COUNT] = {
 	/* F16  */ {1, 2},
 	/* I32  */ {1, 4},
 	/* BF16 */ {1, 2},
+	// Q8_0 split: 32 elements per logical block. Per-element bytes is
+	// 1 (the int8 qs) + 4/32 (the f32 scale) = 1.125, but type_size is
+	// integer-only, so report bytes-per-block = 36 (32*1 + 4) which is
+	// what gets used when a caller wants to size a Q8 buffer.
+	/* Q8_0 */ {32, 36},
 };
 
 // AVX2 batched bf16 -> f32: 8 lanes/iter via vpmovzxwd + vpslld.
@@ -90,9 +96,12 @@ float nnc_type_sizef(const nnc_type t)
 
 size_t nnc_element_size(const nnc_tensor* t) { return g_type_info[t->type].bytes; }
 
-int nnc_nelements(const nnc_tensor* t)
+int64_t nnc_nelements(const nnc_tensor* t)
 {
-	return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];
+	return static_cast<int64_t>(t->ne[0])
+		* static_cast<int64_t>(t->ne[1])
+		* static_cast<int64_t>(t->ne[2])
+		* static_cast<int64_t>(t->ne[3]);
 }
 
 size_t nnc_nbytes(const nnc_tensor* t)
@@ -115,12 +124,21 @@ struct nnc_context
 	size_t offset; // bump pointer in bytes
 };
 
-static size_t align_up(const size_t n, const size_t a) { return (n + a - 1) & ~(a - 1); }
+static size_t align_up(const size_t n, const size_t a)
+{
+	// a is always a power of two; guard against overflow when n is near
+	// SIZE_MAX so the bump-pointer math below stays well-defined.
+	NNC_ASSERT(a > 0 && (a & (a - 1)) == 0);
+	NNC_ASSERT(n <= SIZE_MAX - (a - 1));
+	return (n + a - 1) & ~(a - 1);
+}
 
 static void* arena_alloc(nnc_context* ctx, const size_t bytes)
 {
 	const size_t off = align_up(ctx->offset, NNC_MEM_ALIGN);
-	NNC_ASSERT(off + bytes <= ctx->mem_size && "nnc arena out of memory");
+	// Use "off <= mem_size - bytes" so the addition can never wrap.
+	NNC_ASSERT(bytes <= ctx->mem_size && off <= ctx->mem_size - bytes
+		&& "nnc arena out of memory");
 	ctx->offset = off + bytes;
 	return static_cast<char*>(ctx->mem_buffer) + off;
 }
@@ -344,7 +362,7 @@ nnc_tensor* nnc_view_2d(nnc_context* ctx, nnc_tensor* a, const int ne0, const in
 
 nnc_tensor* nnc_reshape_3d(nnc_context* ctx, nnc_tensor* a, const int ne0, const int ne1, const int ne2)
 {
-	NNC_ASSERT(ne0 * ne1 * ne2 == nnc_nelements(a));
+	NNC_ASSERT(static_cast<int64_t>(ne0) * ne1 * ne2 == nnc_nelements(a));
 	const int ne_r[NNC_MAX_DIMS] = {ne0, ne1, ne2, 1};
 	auto* r = alloc_tensor(ctx, a->type, 3, ne_r, a->data);
 	r->op = NNC_OP_RESHAPE;
@@ -477,7 +495,9 @@ static void forward_add(const nnc_tensor* dst)
 	const auto* a = dst->src0;
 	const auto* b = dst->src1;
 	NNC_ASSERT(a->type == NNC_TYPE_F32 && b->type == NNC_TYPE_F32 && dst->type == NNC_TYPE_F32);
-	const size_t n = nnc_nelements(dst);
+	NNC_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)
+		&& "forward_add: inputs must be contiguous");
+	const size_t n = static_cast<size_t>(nnc_nelements(dst));
 	vec_add_f32(n, static_cast<float*>(dst->data), static_cast<const float*>(a->data),
 	            static_cast<const float*>(b->data));
 }
@@ -487,7 +507,9 @@ static void forward_mul(const nnc_tensor* dst)
 	const auto* a = dst->src0;
 	const auto* b = dst->src1;
 	NNC_ASSERT(a->type == NNC_TYPE_F32 && b->type == NNC_TYPE_F32);
-	const size_t n = nnc_nelements(dst);
+	NNC_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)
+		&& "forward_mul: inputs must be contiguous");
+	const size_t n = static_cast<size_t>(nnc_nelements(dst));
 	vec_mul_f32(n, static_cast<float*>(dst->data), static_cast<const float*>(a->data),
 	            static_cast<const float*>(b->data));
 }
@@ -497,13 +519,13 @@ static void forward_scale(const nnc_tensor* dst)
 	const auto* a = dst->src0;
 	const auto* s = dst->src1;
 	const float scalar = *static_cast<const float*>(s->data);
-	const size_t n = nnc_nelements(dst);
+	const size_t n = static_cast<size_t>(nnc_nelements(dst));
 	vec_scale_f32(n, static_cast<float*>(dst->data), static_cast<const float*>(a->data), scalar);
 }
 
 static void forward_gelu(const nnc_tensor* dst)
 {
-	const size_t n = nnc_nelements(dst);
+	const size_t n = static_cast<size_t>(nnc_nelements(dst));
 	nnc_gelu_f32(static_cast<float*>(dst->data), static_cast<const float*>(dst->src0->data), n);
 }
 
@@ -511,6 +533,8 @@ static void forward_norm(const nnc_tensor* dst)
 {
 	// per-row layernorm over ne[0]; rows = ne[1]*ne[2]*ne[3]. 
 	const auto* a = dst->src0;
+	NNC_ASSERT(a->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)
+		&& "forward_norm: innermost dim must be contiguous");
 	const int ne0 = a->ne[0];
 	const int rows = a->ne[1] * a->ne[2] * a->ne[3];
 	constexpr float eps = 1e-5f;
@@ -525,6 +549,8 @@ static void forward_norm(const nnc_tensor* dst)
 static void forward_soft_max(const nnc_tensor* dst)
 {
 	const auto* a = dst->src0;
+	NNC_ASSERT(a->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)
+		&& "forward_soft_max: innermost dim must be contiguous");
 	const int ne0 = a->ne[0];
 	const int rows = a->ne[1] * a->ne[2] * a->ne[3];
 	for (int r = 0; r < rows; ++r)
@@ -539,6 +565,11 @@ static void forward_soft_max(const nnc_tensor* dst)
 static void forward_diag_mask_inf(const nnc_tensor* dst)
 {
 	const auto* a = dst->src0;
+	NNC_ASSERT(a->type == dst->type && a->nb[0] == dst->nb[0]
+		&& a->nb[1] == dst->nb[1] && a->nb[2] == dst->nb[2] && a->nb[3] == dst->nb[3]
+		&& "forward_diag_mask_inf: src/dst layouts must match");
+	NNC_ASSERT(dst->nb[0] == sizeof(float)
+		&& "forward_diag_mask_inf: innermost dim must be contiguous");
 	const int n_past = dst->op_params[0];
 	const int ne0 = a->ne[0]; // n_past + N
 	const int ne1 = a->ne[1]; // N
@@ -562,6 +593,8 @@ static void forward_repeat(const nnc_tensor* dst)
 	// general broadcast: each output index is taken modulo the source extents.
 	const auto* a = dst->src0;
 	NNC_ASSERT(a->type == NNC_TYPE_F32 && dst->type == NNC_TYPE_F32);
+	NNC_ASSERT(a->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)
+		&& "forward_repeat: innermost dim must be contiguous");
 	const int ne0 = dst->ne[0], ne1 = dst->ne[1], ne2 = dst->ne[2], ne3 = dst->ne[3];
 	const int sa0 = a->ne[0], sa1 = a->ne[1], sa2 = a->ne[2], sa3 = a->ne[3];
 	for (int i3 = 0; i3 < ne3; ++i3)
@@ -584,6 +617,8 @@ static void forward_get_rows(const nnc_tensor* dst)
 	const auto* idx = dst->src1;
 	NNC_ASSERT(idx->type == NNC_TYPE_I32);
 	NNC_ASSERT(dst->type == NNC_TYPE_F32);
+	NNC_ASSERT(a->nb[0] == nnc_element_size(a)
+		&& "forward_get_rows: source innermost dim must be contiguous");
 	const int ne0 = a->ne[0];
 	const int rows = idx->ne[0];
 	const auto* indices = static_cast<const int32_t*>(idx->data);
@@ -599,6 +634,10 @@ static void forward_get_rows(const nnc_tensor* dst)
 		{
 			const auto* h = static_cast<const nnc_fp16_t*>(xrow);
 			for (int i = 0; i < ne0; ++i) y[i] = fp16_to_fp32(h[i]);
+		}
+		else if (a->type == NNC_TYPE_BF16)
+		{
+			nnc_bf16_to_f32_row(static_cast<const nnc_bf16_t*>(xrow), y, static_cast<size_t>(ne0));
 		}
 		else
 		{
@@ -648,6 +687,12 @@ static void forward_cpy(const nnc_tensor* dst)
 					auto* dq = (float*)(dp_base + dst_off);
 					for (int i0 = 0; i0 < ne0; ++i0)
 						dq[i0] = fp16_to_fp32(*(const nnc_fp16_t*)(ap + static_cast<size_t>(i0) * a->nb[0]));
+				}
+				else if (a->type == NNC_TYPE_BF16 && dst->type == NNC_TYPE_F32)
+				{
+					auto* dq = (float*)(dp_base + dst_off);
+					for (int i0 = 0; i0 < ne0; ++i0)
+						dq[i0] = nnc_bf16_to_f32(*(const nnc_bf16_t*)(ap + static_cast<size_t>(i0) * a->nb[0]));
 				}
 				else
 				{
@@ -781,6 +826,36 @@ static void forward_mul_mat_f32_f32(const nnc_tensor* dst)
 			}
 }
 
+// BF16 weights * FP32 activations -> FP32. W is [in, out] contiguous (nb00==2,
+// nb01 == 2*in). x is [in, N], contiguous along the inner dim. Routes to
+// the JITted bf16-w gemv (with bias / GELU fusion identical to the F16 path).
+static void forward_mul_mat_bf16_f32_gemv(const nnc_tensor* dst)
+{
+	const auto* W = dst->src0;
+	const auto* X = dst->src1;
+	NNC_ASSERT(W->n_dims == 2);
+	NNC_ASSERT(W->nb[0] == sizeof(nnc_bf16_t));
+	NNC_ASSERT(X->nb[0] == sizeof(float));
+
+	const int rows = W->ne[1];
+	const int cols = W->ne[0];
+	const int ncols = X->ne[1];
+
+	const float* bias = nnc_fused_bias_for(dst);
+	void* dst_buffer = nnc_fused_dst_for(dst);
+	const bool fuse_gelu = nnc_fused_gelu_for(dst);
+	if (!dst_buffer) dst_buffer = dst->data;
+
+	for (int c = 0; c < ncols; ++c)
+	{
+		const auto xcol = (const float*)(static_cast<const char*>(X->data) + static_cast<size_t>(c) * X->nb[1]);
+		const auto ycol = (float*)(static_cast<char*>(dst_buffer) + static_cast<size_t>(c) * dst->nb[1]);
+		nnc_gemv_bf16w_f32x(W->data, xcol, ycol, static_cast<uint32_t>(rows), static_cast<uint32_t>(cols));
+		if (bias) nnc_add_inplace_f32(ycol, bias, static_cast<size_t>(rows));
+		if (fuse_gelu) nnc_gelu_f32(ycol, ycol, static_cast<size_t>(rows));
+	}
+}
+
 static void forward_mul_mat(const nnc_tensor* dst)
 {
 	const nnc_type t0 = dst->src0->type;
@@ -794,6 +869,13 @@ static void forward_mul_mat(const nnc_tensor* dst)
 			forward_mul_mat_f16_f32_gemv(dst);
 		else
 			forward_mul_mat_f16_f32_general(dst);
+	}
+	else if (t0 == NNC_TYPE_BF16 && t1 == NNC_TYPE_F32)
+	{
+		const auto* A = dst->src0;
+		NNC_ASSERT(A->n_dims == 2 && A->nb[1] == A->nb[0] * static_cast<size_t>(A->ne[0])
+			&& "mul_mat BF16: only 2D contiguous BF16 weights supported");
+		forward_mul_mat_bf16_f32_gemv(dst);
 	}
 	else if (t0 == NNC_TYPE_F32 && t1 == NNC_TYPE_F32)
 	{
@@ -815,7 +897,7 @@ void nnc_graph_compute(nnc_context* /*ctx*/, const nnc_cgraph* g)
 
 	for (int i = 0; i < g->n_nodes; ++i)
 	{
-		nnc_tensor* t = g->nodes[i];
+		const nnc_tensor* t = g->nodes[i];
 		switch (t->op)
 		{
 		case NNC_OP_NONE:

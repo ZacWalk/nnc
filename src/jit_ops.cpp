@@ -12,6 +12,25 @@
 #include <cassert>
 #include <cstdint>
 
+// Emit a JL targeting absolute buffer offset `target` from the current
+// buf.size(). Picks rel8 when the displacement fits, falls back to rel32
+// otherwise so kernels keep building if their bodies grow.
+static void emit_jl_back(const jit_buffer& buf, x64_emitter& e, const size_t target)
+{
+	const ptrdiff_t after_rel8 = static_cast<ptrdiff_t>(buf.size()) + 2;
+	const ptrdiff_t disp8 = static_cast<ptrdiff_t>(target) - after_rel8;
+	if (disp8 >= -128 && disp8 <= 127)
+	{
+		e.jl_rel8(static_cast<int8_t>(disp8));
+	}
+	else
+	{
+		const ptrdiff_t after_rel32 = static_cast<ptrdiff_t>(buf.size()) + 6;
+		const ptrdiff_t disp32 = static_cast<ptrdiff_t>(target) - after_rel32;
+		e.jl_rel32(static_cast<int32_t>(disp32));
+	}
+}
+
 // =====================================================================
 // dot_f32(const float* a, const float* b, size_t n)
 //   rcx=a  rdx=b  r8=n  -> xmm0
@@ -22,6 +41,8 @@ void nnc_build_dot_f32(jit_buffer& buf)
 	x64_emitter e(buf);
 	avx2_emitter v(buf);
 
+	e.emit_win64_arg_shuffle(3); // (a, b, n)
+
 	e.xor_r32_r32(gpr::rax, gpr::rax);
 	v.vxorps_ymm(ymm::y0, ymm::y0, ymm::y0);
 
@@ -31,8 +52,7 @@ void nnc_build_dot_f32(jit_buffer& buf)
 	v.vfmadd231ps_ymm_mem_basex4(ymm::y0, ymm::y1, gpr::rdx, gpr::rax);
 	e.add_r64_imm8(gpr::rax, 8);
 	e.cmp_r64_r64(gpr::rax, gpr::r8);
-	const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-	e.jl_rel8(static_cast<int8_t>(static_cast<ptrdiff_t>(loop_start) - after_jl));
+	emit_jl_back(buf, e, loop_start);
 
 	v.vextractf128_xmm_ymm(ymm::y1, ymm::y0, 1);
 	v.vaddps_xmm(ymm::y0, ymm::y0, ymm::y1);
@@ -68,13 +88,17 @@ void nnc_build_gemv_f32(jit_buffer& buf, const uint32_t rows, const uint32_t col
 	x64_emitter e(buf);
 	avx2_emitter v(buf);
 
+	e.emit_win64_arg_shuffle(3); // (W, x, y)
+
 	// prologue
 	e.push_r64(gpr::rsi);
 	e.push_r64(gpr::rdi);
 	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y
 	e.xor_r32_r32(gpr::rdi, gpr::rdi); // row = 0
 
-	const int32_t col_bytes_per_row = static_cast<int32_t>(cols) * 4;
+	const int64_t cbpr64 = static_cast<int64_t>(cols) * 4;
+	assert(cbpr64 <= INT32_MAX && "gemv_f32: cols too large for int32 row stride");
+	const int32_t col_bytes_per_row = static_cast<int32_t>(cbpr64);
 
 	// row_loop:
 	const size_t row_loop = buf.size();
@@ -88,12 +112,7 @@ void nnc_build_gemv_f32(jit_buffer& buf, const uint32_t rows, const uint32_t col
 	v.vfmadd231ps_ymm_mem_basex4(ymm::y0, ymm::y1, gpr::rdx, gpr::rax);
 	e.add_r64_imm8(gpr::rax, 8);
 	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
-	{
-		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
-		assert(disp >= -128 && disp <= 127);
-		e.jl_rel8(static_cast<int8_t>(disp));
-	}
+	emit_jl_back(buf, e, col_loop);
 
 	// horizontal reduce ymm0 -> xmm0[0]
 	v.vextractf128_xmm_ymm(ymm::y1, ymm::y0, 1);
@@ -108,13 +127,7 @@ void nnc_build_gemv_f32(jit_buffer& buf, const uint32_t rows, const uint32_t col
 	e.add_r64_imm32(gpr::rcx, col_bytes_per_row);
 	e.add_r64_imm8(gpr::rdi, 1);
 	e.cmp_r64_imm32(gpr::rdi, static_cast<int32_t>(rows));
-	{
-		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-		const ptrdiff_t disp = static_cast<ptrdiff_t>(row_loop) - after_jl;
-		assert(disp >= -128 && disp <= 127
-			&& "row_loop too large for rel8; need rel32 jcc");
-		e.jl_rel8(static_cast<int8_t>(disp));
-	}
+	emit_jl_back(buf, e, row_loop);
 
 	// epilogue
 	v.vzeroupper();
@@ -141,6 +154,8 @@ void nnc_build_dot_f16_to_f32(jit_buffer& buf, const uint32_t n)
 
 	x64_emitter e(buf);
 	avx2_emitter v(buf);
+
+	e.emit_win64_arg_shuffle(2); // (x, y)
 
 	v.vxorps_ymm(ymm::y0, ymm::y0, ymm::y0);
 	v.vxorps_ymm(ymm::y1, ymm::y1, ymm::y1);
@@ -213,13 +228,17 @@ void nnc_build_gemv_f16w_f32x(jit_buffer& buf, const uint32_t rows, const uint32
 	// throughput) and roughly quadruples the inner-loop ILP.
 	const bool unroll4 = (cols % 32) == 0;
 
+	e.emit_win64_arg_shuffle(3); // (W, x, y)
+
 	// prologue
 	e.push_r64(gpr::rsi);
 	e.push_r64(gpr::rdi);
 	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y
 	e.xor_r32_r32(gpr::rdi, gpr::rdi); // row = 0
 
-	const int32_t row_bytes = static_cast<int32_t>(cols) * 2; // FP16 row stride
+	const int64_t row_bytes64 = static_cast<int64_t>(cols) * 2; // FP16 row stride
+	assert(row_bytes64 <= INT32_MAX && "gemv_f16w: cols too large for int32 row stride");
+	const int32_t row_bytes = static_cast<int32_t>(row_bytes64);
 
 	// row_loop:
 	const size_t row_loop = buf.size();
@@ -265,12 +284,7 @@ void nnc_build_gemv_f16w_f32x(jit_buffer& buf, const uint32_t rows, const uint32
 		e.add_r64_imm8(gpr::rax, 8);
 	}
 	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
-	{
-		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
-		assert(disp >= -128 && disp <= 127);
-		e.jl_rel8(static_cast<int8_t>(disp));
-	}
+	emit_jl_back(buf, e, col_loop);
 
 	// reduce 4 accumulators -> ymm0 (only needed for unroll4 path)
 	if (unroll4)
@@ -327,12 +341,16 @@ void nnc_build_gemv_bf16w_f32x(jit_buffer& buf, const uint32_t rows, const uint3
 
 	const bool unroll4 = (cols % 32) == 0;
 
+	e.emit_win64_arg_shuffle(3); // (W, x, y)
+
 	e.push_r64(gpr::rsi);
 	e.push_r64(gpr::rdi);
 	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y
 	e.xor_r32_r32(gpr::rdi, gpr::rdi); // row = 0
 
-	const int32_t row_bytes = static_cast<int32_t>(cols) * 2; // BF16 row stride
+	const int64_t row_bytes64 = static_cast<int64_t>(cols) * 2; // BF16 row stride
+	assert(row_bytes64 <= INT32_MAX && "gemv_bf16w: cols too large for int32 row stride");
+	const int32_t row_bytes = static_cast<int32_t>(row_bytes64);
 
 	const size_t row_loop = buf.size();
 
@@ -379,12 +397,7 @@ void nnc_build_gemv_bf16w_f32x(jit_buffer& buf, const uint32_t rows, const uint3
 		e.add_r64_imm8(gpr::rax, 8);
 	}
 	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
-	{
-		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
-		assert(disp >= -128 && disp <= 127);
-		e.jl_rel8(static_cast<int8_t>(disp));
-	}
+	emit_jl_back(buf, e, col_loop);
 
 	if (unroll4)
 	{
@@ -447,7 +460,11 @@ void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, const uint32_t rows, const 
 	x64_emitter e(buf);
 	avx2_emitter v(buf);
 
-	const int32_t row_bytes = static_cast<int32_t>(cols) * 2; // BF16 row stride
+	const int64_t row_bytes64 = static_cast<int64_t>(cols) * 2; // BF16 row stride
+	assert(row_bytes64 <= INT32_MAX && "gemv_bf16w: cols too large for int32 row stride");
+	const int32_t row_bytes = static_cast<int32_t>(row_bytes64);
+
+	e.emit_win64_arg_shuffle(3); // (W, x, y)
 
 	e.push_r64(gpr::rsi);
 	e.push_r64(gpr::rdi);
@@ -487,15 +504,7 @@ void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, const uint32_t rows, const 
 
 	e.add_r64_imm8(gpr::rax, 8);
 	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
-	{
-		const ptrdiff_t after_jl = static_cast<ptrdiff_t>(buf.size()) + 2;
-		const ptrdiff_t disp = static_cast<ptrdiff_t>(col_loop) - after_jl;
-		// Inner body grows with disp32 forms; if it ever exceeds rel8,
-		// we'd need rel32. For all current Gemma shapes the body stays
-		// well under 100 bytes, so this fits.
-		assert(disp >= -128 && disp <= 127);
-		e.jl_rel8(static_cast<int8_t>(disp));
-	}
+	emit_jl_back(buf, e, col_loop);
 
 	// Reduce 4 ymm partial sums into 4 contiguous floats in xmm0.
 	v.vhaddps_ymm(ymm::y0, ymm::y0, ymm::y1);
@@ -516,6 +525,96 @@ void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, const uint32_t rows, const 
 		const ptrdiff_t disp = static_cast<ptrdiff_t>(row_loop) - after_jl;
 		e.jl_rel32(static_cast<int32_t>(disp));
 	}
+
+	v.vzeroupper();
+	e.pop_r64(gpr::rdi);
+	e.pop_r64(gpr::rsi);
+	e.ret();
+}
+
+// =====================================================================
+// gemv_q8_0_f32x_1row(qs, x, y_out, scales)   — single-row Q8_0 dot.
+//   rcx=qs (int8 row, length cols)
+//   rdx=x  (fp32, length cols)
+//   r8 =y_out (one fp32 scalar)
+//   r9 =scales (fp32, length cols/32, one per Q8_0 block)
+//
+// Writes *y_out = sum over blocks b of  scales[b] * sum_{k in b} qs[k] * x[k]
+//
+// Per-block inner-loop body (32 cols, 4 unrolled 8-col FMA steps):
+//   vbroadcastss y3, [rdi]         ; broadcast block scale
+//   for k in 0,8,16,24:
+//     vmovups   y1, [rdx + rax*4 + k*4]    ; x[rax+k..rax+k+7]
+//     vpmovsxbd y2, [rcx + rax + k]        ; 8 i8 -> 8 i32
+//     vcvtdq2ps y2, y2                     ; -> 8 f32
+//     vmulps    y2, y2, y3                 ; * scale
+//     vfmadd231ps y0, y2, y1               ; acc += scaled_q * x
+//   add rax, 32 ; add rdi, 4 ; cmp rax, cols ; jl
+//
+// We pre-multiply qs by the scale and FMA with x (rather than FMA qs*x
+// then mul-add scale at the end of the block) because that keeps a
+// single ymm accumulator and avoids needing 4 partial sums per block.
+// The extra vmulps per inner step is negligible — decode is BW bound.
+// =====================================================================
+void nnc_build_gemv_q8_0_f32x_1row(jit_buffer& buf, const uint32_t cols)
+{
+	assert(cols > 0 && (cols % 32) == 0);
+
+	x64_emitter e(buf);
+	avx2_emitter v(buf);
+
+	e.emit_win64_arg_shuffle(4); // (qs, x, y_out, scales)
+
+	e.push_r64(gpr::rsi);
+	e.push_r64(gpr::rdi);
+	e.mov_r64_r64_srcext_ok(gpr::rsi, gpr::r8); // rsi = y_out
+	e.mov_r64_r64_srcext_ok(gpr::rdi, gpr::r9); // rdi = scales
+
+	v.vxorps_ymm(ymm::y0, ymm::y0, ymm::y0);
+	e.xor_r32_r32(gpr::rax, gpr::rax); // rax = col index
+
+	const size_t block_loop = buf.size();
+
+	v.vbroadcastss_ymm_load_base(ymm::y3, gpr::rdi);
+
+	v.vmovups_ymm_load_basex4(ymm::y1, gpr::rdx, gpr::rax);
+	v.vpmovsxbd_ymm_load_basex1(ymm::y2, gpr::rcx, gpr::rax);
+	v.vcvtdq2ps_ymm_ymm(ymm::y2, ymm::y2);
+	v.vmulps_ymm_ymm_ymm(ymm::y2, ymm::y2, ymm::y3);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y2, ymm::y1);
+
+	v.vmovups_ymm_load_basex4_disp8(ymm::y1, gpr::rdx, gpr::rax, 32);
+	v.vpmovsxbd_ymm_load_basex1_disp8(ymm::y2, gpr::rcx, gpr::rax, 8);
+	v.vcvtdq2ps_ymm_ymm(ymm::y2, ymm::y2);
+	v.vmulps_ymm_ymm_ymm(ymm::y2, ymm::y2, ymm::y3);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y2, ymm::y1);
+
+	v.vmovups_ymm_load_basex4_disp8(ymm::y1, gpr::rdx, gpr::rax, 64);
+	v.vpmovsxbd_ymm_load_basex1_disp8(ymm::y2, gpr::rcx, gpr::rax, 16);
+	v.vcvtdq2ps_ymm_ymm(ymm::y2, ymm::y2);
+	v.vmulps_ymm_ymm_ymm(ymm::y2, ymm::y2, ymm::y3);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y2, ymm::y1);
+
+	v.vmovups_ymm_load_basex4_disp8(ymm::y1, gpr::rdx, gpr::rax, 96);
+	v.vpmovsxbd_ymm_load_basex1_disp8(ymm::y2, gpr::rcx, gpr::rax, 24);
+	v.vcvtdq2ps_ymm_ymm(ymm::y2, ymm::y2);
+	v.vmulps_ymm_ymm_ymm(ymm::y2, ymm::y2, ymm::y3);
+	v.vfmadd231ps_ymm_ymm_ymm(ymm::y0, ymm::y2, ymm::y1);
+
+	e.add_r64_imm8(gpr::rax, 32);
+	e.add_r64_imm8(gpr::rdi, 4);
+	e.cmp_r64_imm32(gpr::rax, static_cast<int32_t>(cols));
+	emit_jl_back(buf, e, block_loop);
+
+	v.vextractf128_xmm_ymm(ymm::y1, ymm::y0, 1);
+	v.vaddps_xmm(ymm::y0, ymm::y0, ymm::y1);
+	v.vhaddps_xmm(ymm::y0, ymm::y0, ymm::y0);
+	v.vhaddps_xmm(ymm::y0, ymm::y0, ymm::y0);
+
+	// rdi no longer needed for scales — reuse as zero index for the
+	// existing SIB-form vmovss store: vmovss [rsi + rdi*4], xmm0.
+	e.xor_r32_r32(gpr::rdi, gpr::rdi);
+	v.vmovss_store_basex4(gpr::rsi, gpr::rdi, ymm::y0);
 
 	v.vzeroupper();
 	e.pop_r64(gpr::rdi);

@@ -4,11 +4,14 @@
 #include "nn_ops.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <queue>
 #include <vector>
 
 namespace
@@ -73,10 +76,79 @@ namespace
 	// Construct an nnc_tensor descriptor from a GGUF tensor index. Data
 	// points into the mmap region (no copy). Strides assume row-major
 	// contiguous storage. Returns nullptr on type-conversion failure.
-	nnc_tensor* tensor_from_gguf(nnc_context* ctx, const gguf_file& f, const size_t idx)
+	nnc_tensor* tensor_from_gguf(nnc_context* ctx, gemma_file& gf,
+	                             const size_t idx)
 	{
+		const gguf_file& f = gf.gguf;
 		if (idx == SIZE_MAX) return nullptr;
 		const auto& gt = f.tensors[idx];
+
+		// K-quant types (Q4_K/Q5_K/Q6_K) are dequanted to BF16 here so
+		// the existing BF16 gemv kernels can consume them. Source bytes
+		// live in the mmap; the destination buffer is owned by `gf` for
+		// the lifetime of the model.
+		const bool is_kquant =
+			(gt.ggml_type == 12 || gt.ggml_type == 13 || gt.ggml_type == 14);
+		if (is_kquant)
+		{
+			const uint64_t n = gguf_tensor_nelements(gt);
+			if (n == 0 || (n % 256) != 0)
+			{
+				fprintf(stderr,
+				        "gemma: K-quant tensor '%s' has %llu elems "
+				        "(not multiple of 256)\n",
+				        gt.name.c_str(),
+				        static_cast<unsigned long long>(n));
+				return nullptr;
+			}
+			const void* src = gguf_tensor_data(f, idx);
+			if (!src)
+			{
+				fprintf(stderr,
+				        "gemma: K-quant tensor '%s' has no mapped data\n",
+				        gt.name.c_str());
+				return nullptr;
+			}
+
+			// Dequant Q*_K -> F32 -> BF16. Two-pass to avoid carrying a
+			// dedicated K-quant->BF16 kernel; happens once at load time.
+			std::vector<float> tmp(static_cast<size_t>(n));
+			if (!nnc_dequantize_kquant_to_f32(gt.ggml_type, src, tmp.data(),
+			                                  static_cast<size_t>(n)))
+			{
+				fprintf(stderr, "gemma: dequant failed for '%s'\n",
+				        gt.name.c_str());
+				return nullptr;
+			}
+			const size_t total = static_cast<size_t>(n) * sizeof(nnc_bf16_t);
+			auto buf = std::unique_ptr<uint8_t[]>(
+				new(std::nothrow) uint8_t[total]);
+			if (!buf)
+			{
+				fprintf(stderr,
+				        "gemma: alloc %zu bytes failed for dequanted '%s'\n",
+				        total, gt.name.c_str());
+				return nullptr;
+			}
+			auto* dst = reinterpret_cast<nnc_bf16_t*>(buf.get());
+			for (size_t i = 0; i < static_cast<size_t>(n); ++i)
+				dst[i] = nnc_f32_to_bf16(tmp[i]);
+
+			auto* x = nnc_new_tensor_1d(ctx, NNC_TYPE_BF16, 1);
+			x->n_dims = static_cast<int>(gt.n_dims);
+			for (int d = 0; d < NNC_MAX_DIMS; ++d)
+				x->ne[d] = (d < static_cast<int>(gt.n_dims))
+					           ? static_cast<int>(gt.ne[d])
+					           : 1;
+			x->nb[0] = nnc_type_size(NNC_TYPE_BF16);
+			x->nb[1] = x->nb[0] * x->ne[0];
+			x->nb[2] = x->nb[1] * x->ne[1];
+			x->nb[3] = x->nb[2] * x->ne[2];
+			x->data = buf.get();
+			gf.dequant_buffers.push_back(std::move(buf));
+			return x;
+		}
+
 		const nnc_type t = to_nnc_type(gt.ggml_type);
 		if (t == NNC_TYPE_COUNT)
 		{
@@ -97,14 +169,68 @@ namespace
 		x->nb[2] = x->nb[1] * x->ne[1];
 		x->nb[3] = x->nb[2] * x->ne[2];
 		x->data = const_cast<void*>(gguf_tensor_data(f, idx));
+		if (!x->data)
+		{
+			fprintf(stderr, "gemma: tensor '%s' has no mapped data (offset OOB?)\n",
+			        gt.name.c_str());
+			return nullptr;
+		}
 		return x;
 	}
 
-	nnc_tensor* tensor_by_name(nnc_context* ctx, const gguf_file& f, const std::string& name)
+	nnc_tensor* tensor_by_name(nnc_context* ctx, gemma_file& gf,
+	                           const std::string& name)
 	{
-		const size_t idx = gguf_find_tensor(f, name);
+		const size_t idx = gguf_find_tensor(gf.gguf, name);
 		if (idx == SIZE_MAX) return nullptr;
-		return tensor_from_gguf(ctx, f, idx);
+		return tensor_from_gguf(ctx, gf, idx);
+	}
+
+	// Per-tensor weight gemv dispatch. Tensor stores ne[0]=cols (fast dim,
+	// the input length to the dot) and ne[1]=rows (number of dots / output
+	// length). When `T` is Q8_0 we pull qs and scales from the same
+	// allocation (qs first, scales after rows*cols bytes).
+	void gw_gemv(const nnc_tensor* T, const float* x, float* y)
+	{
+		const uint32_t cols = static_cast<uint32_t>(T->ne[0]);
+		const uint32_t rows = static_cast<uint32_t>(T->ne[1]);
+		if (T->type == NNC_TYPE_Q8_0)
+		{
+			const auto* qs = static_cast<const int8_t*>(T->data);
+			const auto* scales = reinterpret_cast<const float*>(
+				qs + static_cast<size_t>(rows) * cols);
+			nnc_gemv_q8_0_f32x(qs, scales, x, y, rows, cols);
+			return;
+		}
+		nnc_gemv_bf16w_f32x(T->data, x, y, rows, cols);
+	}
+
+	// Per-tensor weight gemv + argmax (lm_head greedy decode). For BF16
+	// uses the fused streaming kernel; for Q8_0 materialises the full
+	// logits and does a scalar argmax (~1 MB write at vocab=262144,
+	// negligible vs the gemv itself).
+	int gw_argmax(const nnc_tensor* T, const float* x)
+	{
+		const uint32_t cols = static_cast<uint32_t>(T->ne[0]);
+		const uint32_t rows = static_cast<uint32_t>(T->ne[1]);
+		if (T->type == NNC_TYPE_Q8_0)
+		{
+			std::vector<float> logits(rows);
+			const auto* qs = static_cast<const int8_t*>(T->data);
+			const auto* scales = reinterpret_cast<const float*>(
+				qs + static_cast<size_t>(rows) * cols);
+			nnc_gemv_q8_0_f32x(qs, scales, x, logits.data(), rows, cols);
+			int best = 0;
+			float bv = logits[0];
+			for (uint32_t r = 1; r < rows; ++r)
+				if (logits[r] > bv)
+				{
+					bv = logits[r];
+					best = static_cast<int>(r);
+				}
+			return best;
+		}
+		return nnc_gemv_bf16w_argmax_f32x(T->data, x, rows, cols);
 	}
 }
 
@@ -114,32 +240,96 @@ bool gemma_load(const std::string& path, gemma_file& out)
 	const gguf_file& f = out.gguf;
 
 	// --- architecture sanity check ----------------------------------
-	if (!kv_str(f, "general.architecture", out.hparams.arch) || out.hparams.arch != "gemma4")
+	// Accept the gemma3 family in addition to gemma4 — gemma3 is the
+	// same tensor topology minus PLE and with a few hparam renames.
+	if (!kv_str(f, "general.architecture", out.hparams.arch))
 	{
-		fprintf(stderr, "gemma: '%s' has architecture '%s' (expected 'gemma4')\n",
-		        path.c_str(), out.hparams.arch.c_str());
+		fprintf(stderr, "gemma: '%s' has no general.architecture\n", path.c_str());
 		return false;
 	}
+	const std::string& arch = out.hparams.arch;
+	if (arch != "gemma4" && arch != "gemma3" && arch != "llama")
+	{
+		fprintf(stderr, "gemma: '%s' has architecture '%s' (expected 'gemma3', 'gemma4', or 'llama')\n",
+		        path.c_str(), arch.c_str());
+		return false;
+	}
+
+	// Helper: build "<arch>.<suffix>" key for this model.
+	auto akey = [&](const char* suffix) -> std::string
+	{
+		return arch + "." + suffix;
+	};
 
 	// --- hparams ----------------------------------------------------
 	auto& h = out.hparams;
 	bool ok = true;
-	ok &= kv_int(f, "gemma4.context_length", h.n_ctx);
-	ok &= kv_int(f, "gemma4.embedding_length", h.n_embd);
-	ok &= kv_int(f, "gemma4.block_count", h.n_layer);
-	ok &= kv_int(f, "gemma4.attention.head_count", h.n_head);
-	ok &= kv_int(f, "gemma4.attention.head_count_kv", h.n_head_kv);
-	ok &= kv_int(f, "gemma4.attention.key_length", h.head_dim);
-	ok &= kv_int(f, "gemma4.attention.key_length_swa", h.head_dim_swa);
-	ok &= kv_int(f, "gemma4.rope.dimension_count", h.rope_dim);
-	ok &= kv_int(f, "gemma4.rope.dimension_count_swa", h.rope_dim_swa);
-	ok &= kv_float(f, "gemma4.rope.freq_base", h.rope_freq_base);
-	ok &= kv_float(f, "gemma4.rope.freq_base_swa", h.rope_freq_base_swa);
-	ok &= kv_float(f, "gemma4.attention.layer_norm_rms_epsilon", h.rms_eps);
-	kv_int(f, "gemma4.attention.sliding_window", h.sliding_window);
-	kv_int(f, "gemma4.attention.shared_kv_layers", h.shared_kv_layers);
-	kv_int(f, "gemma4.embedding_length_per_layer_input", h.ple_dim);
-	kv_float(f, "gemma4.final_logit_softcapping", h.final_logit_softcap);
+	ok &= kv_int(f, akey("context_length").c_str(), h.n_ctx);
+	ok &= kv_int(f, akey("embedding_length").c_str(), h.n_embd);
+	ok &= kv_int(f, akey("block_count").c_str(), h.n_layer);
+	ok &= kv_int(f, akey("attention.head_count").c_str(), h.n_head);
+	ok &= kv_int(f, akey("attention.head_count_kv").c_str(), h.n_head_kv);
+	// llama doesn't publish key_length; derive from rope.dimension_count or n_embd/n_head.
+	if (!kv_int(f, akey("attention.key_length").c_str(), h.head_dim))
+	{
+		int rd = 0;
+		if (kv_int(f, akey("rope.dimension_count").c_str(), rd) && rd > 0)
+			h.head_dim = rd;
+		else if (h.n_head > 0)
+			h.head_dim = h.n_embd / h.n_head;
+	}
+	ok &= kv_float(f, akey("rope.freq_base").c_str(), h.rope_freq_base);
+	ok &= kv_float(f, akey("attention.layer_norm_rms_epsilon").c_str(), h.rms_eps);
+	if (!ok)
+	{
+		fprintf(stderr, "gemma: missing required hparam in '%s'\n", path.c_str());
+		return false;
+	}
+
+	// Optional gemma4-only fields (defaulted otherwise).
+	kv_int(f, akey("attention.key_length_swa").c_str(), h.head_dim_swa);
+	if (h.head_dim_swa <= 0) h.head_dim_swa = h.head_dim;
+	kv_int(f, akey("rope.dimension_count").c_str(), h.rope_dim);
+	if (h.rope_dim <= 0) h.rope_dim = h.head_dim; // gemma3 omits this
+	kv_int(f, akey("rope.dimension_count_swa").c_str(), h.rope_dim_swa);
+	if (h.rope_dim_swa <= 0) h.rope_dim_swa = h.rope_dim;
+	kv_float(f, akey("rope.freq_base_swa").c_str(), h.rope_freq_base_swa);
+	if (h.rope_freq_base_swa <= 0)
+	{
+		// gemma3 uses a hardcoded local-rope theta of 10000 for sliding layers
+		// (HF: rope_local_base_freq); not stored in GGUF.
+		if (h.arch == "gemma3")
+			h.rope_freq_base_swa = 10000.0f;
+		else
+			h.rope_freq_base_swa = h.rope_freq_base;
+	}
+	kv_int(f, akey("attention.sliding_window").c_str(), h.sliding_window);
+	kv_int(f, akey("attention.shared_kv_layers").c_str(), h.shared_kv_layers);
+	kv_int(f, akey("embedding_length_per_layer_input").c_str(), h.ple_dim);
+	kv_float(f, akey("final_logit_softcapping").c_str(), h.final_logit_softcap);
+	bool have_attn_scale = kv_float(f, akey("attention.scale").c_str(), h.attention_scale);
+	if (!have_attn_scale)
+	{
+		// gemma3/llama have no q_norm-absorbed scale; gemma4 (3n) does.
+		if ((h.arch == "gemma3" || h.arch == "llama") && h.head_dim > 0)
+			h.attention_scale = 1.0f / std::sqrt(static_cast<float>(h.head_dim));
+		else
+			h.attention_scale = 1.0f;
+	}
+	if (h.attention_scale <= 0) h.attention_scale = 1.0f;
+
+	// RoPE linear scaling: theta_i is scaled by `1 / factor` (i.e.
+	// effective_pos = pos / factor). Both gemma3-4B and recent llama
+	// finetunes use this. Read string + float from the GGUF metadata.
+	{
+		std::string scaling_type;
+		(void)kv_str(f, akey("rope.scaling.type").c_str(), scaling_type);
+		float factor = 0.0f;
+		(void)kv_float(f, akey("rope.scaling.factor").c_str(), factor);
+		if (scaling_type == "linear" && factor > 0)
+			h.rope_freq_scale = 1.0f / factor;
+	}
+
 	kv_int(f, "general.file_type", h.file_type);
 	if (!ok)
 	{
@@ -203,12 +393,21 @@ bool gemma_load(const std::string& path, gemma_file& out)
 	// token_to_id reverse lookup.
 	out.token_to_id.reserve(out.vocab_tokens.size() * 2);
 	for (size_t i = 0; i < out.vocab_tokens.size(); ++i)
+	{
 		out.token_to_id.emplace(out.vocab_tokens[i], static_cast<int>(i));
+		if (out.vocab_tokens[i].size() > out.max_token_bytes)
+			out.max_token_bytes = out.vocab_tokens[i].size();
+	}
+
+	// tokenizer model name (selects BPE vs Unigram in gemma_tokenize).
+	if (const gguf_value* tm = gguf_find_kv(f, "tokenizer.ggml.model");
+		tm && tm->type == GGUF_TYPE_STRING)
+		out.tokenizer_model = tm->str;
 
 	// --- arena for tensor descriptors -------------------------------
 	// Each descriptor is ~80 bytes; 700 tensors * 80 + slack = a few hundred KB.
 	constexpr size_t mem = 4ull * 1024 * 1024;
-	const nnc_init_params ip{mem, nullptr};
+	constexpr nnc_init_params ip{mem, nullptr};
 	out.ctx = nnc_init(ip);
 	if (!out.ctx)
 	{
@@ -217,12 +416,13 @@ bool gemma_load(const std::string& path, gemma_file& out)
 	}
 
 	// --- top-level weights ------------------------------------------
-	out.token_embd = tensor_by_name(out.ctx, f, "token_embd.weight");
-	out.per_layer_token_embd = tensor_by_name(out.ctx, f, "per_layer_token_embd.weight");
-	out.output_norm = tensor_by_name(out.ctx, f, "output_norm.weight");
-	out.rope_freqs = tensor_by_name(out.ctx, f, "rope_freqs.weight");
-	out.per_layer_model_proj = tensor_by_name(out.ctx, f, "per_layer_model_proj.weight");
-	out.per_layer_proj_norm = tensor_by_name(out.ctx, f, "per_layer_proj_norm.weight");
+	out.token_embd = tensor_by_name(out.ctx, out, "token_embd.weight");
+	out.per_layer_token_embd = tensor_by_name(out.ctx, out, "per_layer_token_embd.weight");
+	out.output_norm = tensor_by_name(out.ctx, out, "output_norm.weight");
+	out.output = tensor_by_name(out.ctx, out, "output.weight");
+	out.rope_freqs = tensor_by_name(out.ctx, out, "rope_freqs.weight");
+	out.per_layer_model_proj = tensor_by_name(out.ctx, out, "per_layer_model_proj.weight");
+	out.per_layer_proj_norm = tensor_by_name(out.ctx, out, "per_layer_proj_norm.weight");
 	if (!out.token_embd)
 	{
 		fprintf(stderr, "gemma: missing token_embd.weight\n");
@@ -231,8 +431,15 @@ bool gemma_load(const std::string& path, gemma_file& out)
 
 	// --- per-layer weights ------------------------------------------
 	out.layers.resize(h.n_layer);
-	const gguf_value* swp = gguf_find_kv(f, "gemma4.attention.sliding_window_pattern");
-	const gguf_value* ffl = gguf_find_kv(f, "gemma4.feed_forward_length");
+	const gguf_value* swp = gguf_find_kv(f, akey("attention.sliding_window_pattern").c_str());
+	const gguf_value* ffl = gguf_find_kv(f, akey("feed_forward_length").c_str());
+
+	// gemma3 omits the per-layer pattern array but uses an int periodicity
+	// where every Nth layer is a global (non-SWA) layer. The standard
+	// gemma3 release uses a period of 6.
+	int swa_period = 0;
+	if (arch == "gemma3" && h.sliding_window > 0)
+		swa_period = 6;
 
 	for (int li = 0; li < h.n_layer; ++li)
 	{
@@ -240,17 +447,24 @@ bool gemma_load(const std::string& path, gemma_file& out)
 		char buf[64];
 
 		// E2B has feed_forward_length as an array; E4B has a scalar.
-		if (ffl && ffl->type == GGUF_TYPE_ARRAY && static_cast<int>(ffl->arr.size()) == h.n_layer)
+		if (ffl && ffl->type == GGUF_TYPE_ARRAY && ffl->arr.size() == static_cast<size_t>(h.n_layer))
 			L.n_ff = static_cast<int>(ffl->arr[li].i64);
 		else if (ffl)
 			L.n_ff = static_cast<int>(ffl->u64);
 
-		if (swp && swp->type == GGUF_TYPE_ARRAY && static_cast<int>(swp->arr.size()) == h.n_layer)
+		if (swp && swp->type == GGUF_TYPE_ARRAY && swp->arr.size() == static_cast<size_t>(h.n_layer))
 			L.sliding_window = (swp->arr[li].u64 != 0);
+		else if (swa_period > 0)
+		{
+			// gemma3: every (li+1)%period == 0 layer is a global (full-context)
+			// layer; the rest use SWA. Matches Hugging Face's reference
+			// implementation `is_sliding = bool((i + 1) % sliding_window_pattern)`.
+			L.sliding_window = (((li + 1) % swa_period) != 0);
+		}
 
 #define G(field, name) do { \
 	snprintf(buf, sizeof(buf), "blk.%d." name, li); \
-	L.field = tensor_by_name(out.ctx, f, buf); \
+	L.field = tensor_by_name(out.ctx, out, buf); \
 } while (0)
 
 		G(attn_norm, "attn_norm.weight");
@@ -299,6 +513,8 @@ void gemma_print_info(const gemma_file& f)
 	       h.rope_dim, h.rope_dim_swa, h.rope_freq_base, h.rope_freq_base_swa, h.rms_eps);
 	printf("  ctx=%d sliding_window=%d shared_kv_layers=%d ple_dim=%d softcap=%g\n",
 	       h.n_ctx, h.sliding_window, h.shared_kv_layers, h.ple_dim, h.final_logit_softcap);
+	printf("  attention_scale=%g rope_freq_scale=%g\n",
+	       h.attention_scale, h.rope_freq_scale);
 	printf("  vocab=%d tokens (bos=%d eos=%d unk=%d pad=%d)\n",
 	       h.n_vocab, f.bos_id, f.eos_id, f.unk_id, f.pad_id);
 
@@ -424,15 +640,16 @@ int gemma_probe(const gemma_file& f, const int token_id)
 	       L0.sliding_window ? 1 : 0, q_dim, head_dim, n_head);
 	if (L0.layer_output_scale)
 	{
-		auto lo = static_cast<const float*>(L0.layer_output_scale->data);
+		const auto lo = static_cast<const float*>(L0.layer_output_scale->data);
+		const long long n0 = L0.layer_output_scale->ne[0];
 		printf("  layer_output_scale: ne=[%lld,%lld,%lld,%lld]  v[0]=%g v[1]=%g v[last]=%g\n",
-		       static_cast<long long>(L0.layer_output_scale->ne[0]),
+		       n0,
 		       static_cast<long long>(L0.layer_output_scale->ne[1]),
 		       static_cast<long long>(L0.layer_output_scale->ne[2]),
 		       static_cast<long long>(L0.layer_output_scale->ne[3]),
-		       lo[0],
-		       (L0.layer_output_scale->ne[0] > 1) ? lo[1] : 0.0f,
-		       lo[L0.layer_output_scale->ne[0] - 1]);
+		       (n0 > 0) ? lo[0] : 0.0f,
+		       (n0 > 1) ? lo[1] : 0.0f,
+		       (n0 > 0) ? lo[n0 - 1] : 0.0f);
 	}
 	if (L0.post_norm)
 	{
@@ -456,7 +673,7 @@ int gemma_probe(const gemma_file& f, const int token_id)
 	// 3. Apply attn_norm gamma. Gemma4 uses plain RMSNorm + gamma multiply
 	// (norm_shift = 0.0 in convert_hf_to_gguf.py: weights stored as-is).
 	std::vector<float> normed(n_embd);
-	auto gamma = static_cast<const float*>(L0.attn_norm->data);
+	const auto gamma = static_cast<const float*>(L0.attn_norm->data);
 	for (int i = 0; i < n_embd; ++i)
 		normed[i] = norm[i] * gamma[i];
 	print_stats("normed * gamma", normed.data(), n_embd);
@@ -466,13 +683,11 @@ int gemma_probe(const gemma_file& f, const int token_id)
 	//    fast dim is the input. nnc_gemv_bf16w_f32x reads rows as
 	//    [rows, cols] = [q_dim, n_embd].
 	std::vector<float> q(q_dim);
-	nnc_gemv_bf16w_f32x(L0.attn_q->data, normed.data(), q.data(),
-	                    static_cast<uint32_t>(q_dim),
-	                    static_cast<uint32_t>(n_embd));
+	gw_gemv(L0.attn_q, normed.data(), q.data());
 	print_stats("Q = W_q * normed", q.data(), q_dim);
 
 	// 5. attn_q_norm is per-head_dim (RMSNorm + (1+gamma) again).
-	auto q_gamma = static_cast<const float*>(L0.attn_q_norm->data);
+	const auto q_gamma = static_cast<const float*>(L0.attn_q_norm->data);
 	for (int hh = 0; hh < n_head; ++hh)
 	{
 		float* qh = q.data() + hh * head_dim;
@@ -569,14 +784,12 @@ namespace
 		apply_gamma(y, gamma_stored, n);
 	}
 
-	// Plain F32 dot product (used for per-head attention scores). The
-	// vectors are tiny (head_dim = 256 or 512), so a scalar loop with
-	// FMA is good enough; the compiler vectorises it.
+	// Plain F32 dot product (used for per-head attention scores). Routes
+	// to the AVX2 4-accumulator helper from nn_ops; for head_dim 256 / 512
+	// the call overhead is amortised by the unrolled inner loop.
 	float dot_f32(const float* a, const float* b, const int n)
 	{
-		float s = 0.0f;
-		for (int i = 0; i < n; ++i) s += a[i] * b[i];
-		return s;
+		return nnc_dot_f32_simd(a, b, static_cast<size_t>(n));
 	}
 
 	struct layer_scratch
@@ -606,7 +819,10 @@ namespace
 		// The hparam key_length=512 disagrees with the actual tensor shapes
 		// (q_dim=2048, k_dim=256, q_norm=[256]) — all layers use head_dim=256
 		// regardless of the sliding-window flag.
-		const int head_dim = L.attn_q_norm->ne[0];
+		// llama / gemma3 don't have q_norm; fall back to hparams.
+		const int head_dim = L.attn_q_norm
+			? L.attn_q_norm->ne[0]
+			: h.head_dim;
 		const int n_head = q_dim / head_dim;
 		const int n_kv = kv_dim / head_dim; // 1 on E2B
 		int n_rot = L.sliding_window ? h.rope_dim_swa : h.rope_dim;
@@ -634,43 +850,65 @@ namespace
 		const int li_kv = reuse_kv
 			                  ? (kv_from_start - (L.sliding_window ? 2 : 1))
 			                  : li;
-
-		nnc_gemv_bf16w_f32x(L.attn_q->data, normed, q,
-		                    static_cast<uint32_t>(q_dim), static_cast<uint32_t>(n_embd));
-		if (!reuse_kv)
+		// The shared-KV math above assumes the source layer's
+		// sliding-window flag matches this layer's, i.e. the alternation
+		// pattern stays consistent across the reuse boundary. Verify it
+		// (cheap, fires loudly if a future GGUF breaks the assumption).
+		if (reuse_kv)
 		{
-			nnc_gemv_bf16w_f32x(L.attn_k->data, normed, k,
-			                    static_cast<uint32_t>(kv_dim), static_cast<uint32_t>(n_embd));
-			nnc_gemv_bf16w_f32x(L.attn_v->data, normed, v,
-			                    static_cast<uint32_t>(kv_dim), static_cast<uint32_t>(n_embd));
+			NNC_ASSERT(li_kv >= 0 && li_kv < h.n_layer);
+			NNC_ASSERT(f.layers[li_kv].sliding_window == L.sliding_window
+				&& "shared-KV pattern mismatch: source layer's SWA flag differs");
 		}
 
-		// Per-head Q / K norms.
-		auto qg = static_cast<const float*>(L.attn_q_norm->data);
-		for (int hd = 0; hd < n_head; ++hd)
-			rmsnorm_with_gamma(q + hd * head_dim, q + hd * head_dim, head_dim, qg, h.rms_eps);
+		gw_gemv(L.attn_q, normed, q);
+		if (!reuse_kv)
+		{
+			gw_gemv(L.attn_k, normed, k);
+			gw_gemv(L.attn_v, normed, v);
+		}
+
+		// Per-head Q / K norms (gemma4 only; gemma3 / llama lack these).
+		if (L.attn_q_norm)
+		{
+			const auto qg = static_cast<const float*>(L.attn_q_norm->data);
+			nnc_rmsnorm_gamma_multi_f32(q, q, n_head, head_dim, qg, h.rms_eps);
+		}
 
 		if (!reuse_kv)
 		{
-			auto kg = static_cast<const float*>(L.attn_k_norm->data);
-			for (int hd = 0; hd < n_kv; ++hd)
-				rmsnorm_with_gamma(k + hd * head_dim, k + hd * head_dim, head_dim, kg, h.rms_eps);
+			if (L.attn_k_norm)
+			{
+				const auto kg = static_cast<const float*>(L.attn_k_norm->data);
+				nnc_rmsnorm_gamma_multi_f32(k, k, n_kv, head_dim, kg, h.rms_eps);
+			}
 
 			// Per-head V plain RMSNorm (no learned gamma) — gemma4 specific.
-			for (int hd = 0; hd < n_kv; ++hd)
+			// gemma3 / llama do NOT normalize V; skip there.
+			if (h.arch == "gemma4")
 			{
-				float* vh = v + hd * head_dim;
-				float ss = 0.0f;
-				for (int i = 0; i < head_dim; ++i) ss += vh[i] * vh[i];
-				const float inv = 1.0f / std::sqrt(ss / head_dim + h.rms_eps);
-				for (int i = 0; i < head_dim; ++i) vh[i] *= inv;
+				for (int hd = 0; hd < n_kv; ++hd)
+				{
+					float* vh = v + hd * head_dim;
+					float ss = 0.0f;
+					for (int i = 0; i < head_dim; ++i) ss += vh[i] * vh[i];
+					const float inv = 1.0f / std::sqrt(ss / head_dim + h.rms_eps);
+					for (int i = 0; i < head_dim; ++i) vh[i] *= inv;
+				}
 			}
 		}
 
 		// RoPE on Q always; K only when freshly computed (cached K is already rotated).
-		nnc_rope_f32(q, n_head, head_dim, n_rot, pos, freq);
+		// Linear position scaling applies only to global (non-SWA) layers
+		// in gemma3 (HF: rope_scaling only on rope_theta, not rope_local_base_freq).
+		// gemma4 applies the same scale across all layers.
+		const float layer_rope_scale = (h.arch == "gemma3" && L.sliding_window)
+			                               ? 1.0f
+			                               : h.rope_freq_scale;
+		const float rpos = static_cast<float>(pos) * layer_rope_scale;
+		nnc_rope_f32(q, n_head, head_dim, n_rot, rpos, freq);
 		if (!reuse_kv)
-			nnc_rope_f32(k, n_kv, head_dim, n_rot, pos, freq);
+			nnc_rope_f32(k, n_kv, head_dim, n_rot, rpos, freq);
 
 		// Append current K/V to per-layer cache (only when freshly computed).
 		float* Kbase = cache.k[li_kv].data();
@@ -686,9 +924,10 @@ namespace
 		const int t_start = (pos + 1 > win) ? (pos + 1 - win) : 0;
 		const int t_end = pos + 1; // inclusive of current pos
 		const int n_t = t_end - t_start;
-		// gemma4 uses f_attention_scale = 1.0 (no pre-softmax scaling).
-		// llama.cpp: hparams.f_attention_scale = 1.0f.
-		constexpr float scale = 1.0f;
+		// Pre-softmax attention scale. Gemma 3n GGUFs typically omit
+		// this (defaults to 1.0); allow override via hparams in case a
+		// future variant publishes a real value.
+		const float scale = (h.attention_scale > 0) ? h.attention_scale : 1.0f;
 
 		float* attn = s.attn_out;
 		float* scores = s.scores;
@@ -703,51 +942,53 @@ namespace
 				const float* kt = Kbase + (t_start + t) * kv_dim + kv_h * head_dim;
 				scores[t] = dot_f32(qh, kt, head_dim) * scale;
 			}
-			nnc_softmax_f32_inplace(scores, static_cast<size_t>(n_t));
 
-			// Weighted sum of V along time axis.
+			// Fused softmax + V matmul: single sweep over t, no
+			// memset of `ah`, no second read of `scores`.
 			float* ah = attn + hd * head_dim;
-			std::memset(ah, 0, sizeof(float) * head_dim);
-			for (int t = 0; t < n_t; ++t)
-			{
-				const float w = scores[t];
-				const float* vt = Vbase + (t_start + t) * kv_dim + kv_h * head_dim;
-				for (int i = 0; i < head_dim; ++i) ah[i] += w * vt[i];
-			}
+			const float* Vh = Vbase + t_start * kv_dim + kv_h * head_dim;
+			nnc_attn_softmax_v_f32(ah, scores, Vh,
+			                       static_cast<size_t>(n_t),
+			                       static_cast<size_t>(kv_dim),
+			                       static_cast<size_t>(head_dim));
 		}
 
 		// Output projection: [q_dim] -> [n_embd].
 		float* attn_out = s.normed; // reuse
-		nnc_gemv_bf16w_f32x(L.attn_output->data, attn, attn_out,
-		                    static_cast<uint32_t>(n_embd), static_cast<uint32_t>(q_dim));
+		gw_gemv(L.attn_output, attn, attn_out);
 
-		// Post-attention RMSNorm + residual.
-		rmsnorm_with_gamma(attn_out, attn_out, n_embd,
-		                   static_cast<const float*>(L.post_attention_norm->data), h.rms_eps);
+		// Post-attention RMSNorm (gemma4) + residual. llama / gemma3 omit this norm.
+		if (L.post_attention_norm)
+		{
+			rmsnorm_with_gamma(attn_out, attn_out, n_embd,
+			                   static_cast<const float*>(L.post_attention_norm->data), h.rms_eps);
+		}
 		nnc_add_inplace_f32(x.data(), attn_out, n_embd);
 
-		// --- MLP block (gated GELU, PAR) ---
-		// Gemma 4 uses LLM_FFN_GELU + LLM_FFN_PAR:
-		//   y = ffn_down( gelu(ffn_gate(x)) * ffn_up(x) )
+		// --- MLP block (gated, PAR) ---
+		// Gemma uses gelu(gate)*up; llama uses silu(gate)*up (SwiGLU).
 		rmsnorm_with_gamma(normed, x.data(), n_embd,
 		                   static_cast<const float*>(L.ffn_norm->data), h.rms_eps);
 
 		const int n_ff = L.n_ff;
 		float* gate = s.gate;
 		float* up = s.up;
-		nnc_gemv_bf16w_f32x(L.ffn_gate->data, normed, gate,
-		                    static_cast<uint32_t>(n_ff), static_cast<uint32_t>(n_embd));
-		nnc_gemv_bf16w_f32x(L.ffn_up->data, normed, up,
-		                    static_cast<uint32_t>(n_ff), static_cast<uint32_t>(n_embd));
-		nnc_gelu_f32(gate, gate, static_cast<size_t>(n_ff));
-		nnc_mul_inplace_f32(gate, up, static_cast<size_t>(n_ff));
+		gw_gemv(L.ffn_gate, normed, gate);
+		gw_gemv(L.ffn_up, normed, up);
+		if (h.arch == "llama")
+			nnc_swiglu_f32(gate, gate, up, static_cast<size_t>(n_ff));
+		else
+			nnc_gelu_mul_f32(gate, gate, up, static_cast<size_t>(n_ff));
 
 		float* ffn_out = s.normed;
-		nnc_gemv_bf16w_f32x(L.ffn_down->data, gate, ffn_out,
-		                    static_cast<uint32_t>(n_embd), static_cast<uint32_t>(n_ff));
+		gw_gemv(L.ffn_down, gate, ffn_out);
 
-		rmsnorm_with_gamma(ffn_out, ffn_out, n_embd,
-		                   static_cast<const float*>(L.post_ffw_norm->data), h.rms_eps);
+		// Post-FFW RMSNorm (gemma4) — llama / gemma3 omit.
+		if (L.post_ffw_norm)
+		{
+			rmsnorm_with_gamma(ffn_out, ffn_out, n_embd,
+			                   static_cast<const float*>(L.post_ffw_norm->data), h.rms_eps);
+		}
 		nnc_add_inplace_f32(x.data(), ffn_out, n_embd);
 
 		// --- Per-Layer Embedding (PLE) block ---
@@ -757,14 +998,12 @@ namespace
 		{
 			const int ple_dim = L.inp_gate->ne[1]; // [n_embd, ple_dim]
 			float* g = s.ple_gate;
-			nnc_gemv_bf16w_f32x(L.inp_gate->data, x.data(), g,
-			                    static_cast<uint32_t>(ple_dim), static_cast<uint32_t>(n_embd));
+			gw_gemv(L.inp_gate, x.data(), g);
 			nnc_gelu_f32(g, g, static_cast<size_t>(ple_dim));
 			nnc_mul_inplace_f32(g, s.ple_for_layer, static_cast<size_t>(ple_dim));
 
 			float* contrib = s.ple_contrib;
-			nnc_gemv_bf16w_f32x(L.proj->data, g, contrib,
-			                    static_cast<uint32_t>(n_embd), static_cast<uint32_t>(ple_dim));
+			gw_gemv(L.proj, g, contrib);
 			if (L.post_norm)
 				rmsnorm_with_gamma(contrib, contrib, n_embd,
 				                   static_cast<const float*>(L.post_norm->data), h.rms_eps);
@@ -773,7 +1012,7 @@ namespace
 
 		// --- per-layer output scale (gemma4 layer_scalar) ---
 		// Multiplies the entire residual stream before next layer.
-		if (L.layer_output_scale)
+		if (L.layer_output_scale && L.layer_output_scale->ne[0] > 0)
 		{
 			const float s_val = static_cast<const float*>(L.layer_output_scale->data)[0];
 			for (int i = 0; i < n_embd; ++i) x.data()[i] *= s_val;
@@ -787,13 +1026,15 @@ namespace
 
 bool gemma_kv_init(const gemma_file& f, gemma_kv_cache& cache, const int n_ctx)
 {
-	const int n_layer = f.hparams.n_layer;
+	const auto& h = f.hparams;
+	const int n_layer = h.n_layer;
 	cache.n_ctx = n_ctx;
 	cache.cur_pos = 0;
 	cache.kv_dim_per_layer.assign(n_layer, 0);
 	cache.k.assign(n_layer, {});
 	cache.v.assign(n_layer, {});
 	size_t total_bytes = 0;
+	int max_q_dim = 0, max_kv_dim = 0, max_ff = 0;
 	for (int li = 0; li < n_layer; ++li)
 	{
 		const int kv_dim = f.layers[li].attn_k ? f.layers[li].attn_k->ne[1] : 0;
@@ -802,7 +1043,31 @@ bool gemma_kv_init(const gemma_file& f, gemma_kv_cache& cache, const int n_ctx)
 		cache.k[li].assign(n, 0.0f);
 		cache.v[li].assign(n, 0.0f);
 		total_bytes += 2 * n * sizeof(float);
+
+		if (f.layers[li].attn_q && f.layers[li].attn_q->ne[1] > max_q_dim)
+			max_q_dim = f.layers[li].attn_q->ne[1];
+		if (kv_dim > max_kv_dim) max_kv_dim = kv_dim;
+		if (f.layers[li].n_ff > max_ff) max_ff = f.layers[li].n_ff;
 	}
+
+	// One-time scratch allocation (resize, not assign — first eval_token
+	// will write every element before reading it).
+	const int ple_dim = (h.ple_dim > 0) ? h.ple_dim : 0;
+	const int ple_total = ple_dim * n_layer;
+	cache.sx.resize(h.n_embd);
+	cache.snormed.resize(h.n_embd);
+	cache.sq.resize(max_q_dim);
+	cache.sk_cur.resize(max_kv_dim);
+	cache.sv_cur.resize(max_kv_dim);
+	cache.sattn.resize(max_q_dim);
+	cache.sgate.resize(max_ff);
+	cache.sup.resize(max_ff);
+	cache.sscores.resize(n_ctx);
+	cache.sple_gate.resize(ple_dim > 0 ? ple_dim : 1);
+	cache.sple_contrib.resize(h.n_embd);
+	cache.sple_inputs.resize(ple_total > 0 ? ple_total : 1);
+	cache.sple_proj.resize(ple_total > 0 ? ple_total : 1);
+
 	printf("gemma_kv_init: n_ctx=%d  cache size = %.1f MB\n",
 	       n_ctx, total_bytes / (1024.0 * 1024.0));
 	return true;
@@ -813,6 +1078,19 @@ void gemma_kv_free(gemma_kv_cache& cache)
 	cache.k.clear();
 	cache.v.clear();
 	cache.kv_dim_per_layer.clear();
+	cache.sx.clear();
+	cache.snormed.clear();
+	cache.sq.clear();
+	cache.sk_cur.clear();
+	cache.sv_cur.clear();
+	cache.sattn.clear();
+	cache.sgate.clear();
+	cache.sup.clear();
+	cache.sscores.clear();
+	cache.sple_gate.clear();
+	cache.sple_contrib.clear();
+	cache.sple_inputs.clear();
+	cache.sple_proj.clear();
 	cache.n_ctx = 0;
 	cache.cur_pos = 0;
 }
@@ -825,11 +1103,10 @@ namespace
 {
 	// Runs every step of the per-token forward pass except the final
 	// lm_head projection: embed -> PLE inputs -> all layers -> output_norm.
-	// On success, `x_out` is filled with the post-output_norm hidden state
+	// On success, the post-output_norm hidden state lives in cache.sx
 	// (length h.n_embd) ready to feed into the lm_head.
 	int gemma_forward_to_x(const gemma_file& f, gemma_kv_cache& cache,
-	                       const int token_id, const int pos,
-	                       std::vector<float>& x_out)
+	                       const int token_id, const int pos)
 	{
 		const auto& h = f.hparams;
 		if (pos != cache.cur_pos)
@@ -845,84 +1122,79 @@ namespace
 			return 1;
 		}
 
-		int max_q_dim = 0, max_kv_dim = 0, max_ff = 0;
-		for (const auto& L : f.layers)
-		{
-			if (L.attn_q && L.attn_q->ne[1] > max_q_dim) max_q_dim = L.attn_q->ne[1];
-			if (L.attn_k && L.attn_k->ne[1] > max_kv_dim) max_kv_dim = L.attn_k->ne[1];
-			if (L.n_ff > max_ff) max_ff = L.n_ff;
-		}
-
 		const int ple_dim = (h.ple_dim > 0) ? h.ple_dim : 0;
 		const int ple_total = ple_dim * h.n_layer;
 
-		x_out.assign(h.n_embd, 0.0f);
-		std::vector<float> bnormed(h.n_embd);
-		std::vector<float> bq(max_q_dim);
-		std::vector<float> bkcur(max_kv_dim);
-		std::vector<float> bvcur(max_kv_dim);
-		std::vector<float> battn(max_q_dim);
-		std::vector<float> bgate(max_ff);
-		std::vector<float> bup(max_ff);
-		std::vector<float> bscores(cache.n_ctx);
-		std::vector<float> bple_gate(ple_dim > 0 ? ple_dim : 1);
-		std::vector<float> bple_contrib(h.n_embd);
-		std::vector<float> bple_inputs(ple_total > 0 ? ple_total : 1);
+		float* xp = cache.sx.data();
 
 		layer_scratch s{};
-		s.normed = bnormed.data();
-		s.q = bq.data();
-		s.k_cur = bkcur.data();
-		s.v_cur = bvcur.data();
-		s.attn_out = battn.data();
-		s.gate = bgate.data();
-		s.up = bup.data();
-		s.scores = bscores.data();
-		s.ple_gate = bple_gate.data();
-		s.ple_contrib = bple_contrib.data();
+		s.normed = cache.snormed.data();
+		s.q = cache.sq.data();
+		s.k_cur = cache.sk_cur.data();
+		s.v_cur = cache.sv_cur.data();
+		s.attn_out = cache.sattn.data();
+		s.gate = cache.sgate.data();
+		s.up = cache.sup.data();
+		s.scores = cache.sscores.data();
+		s.ple_gate = cache.sple_gate.data();
+		s.ple_contrib = cache.sple_contrib.data();
 		s.ple_for_layer = nullptr;
 
-		const float embd_scale = std::sqrt(static_cast<float>(h.n_embd));
-		nnc_embed_row_bf16(x_out.data(), f.token_embd->data, token_id,
+		// Gemma scales the embedding by sqrt(n_embd); llama does not.
+		const float embd_scale = (h.arch == "llama")
+			? 1.0f
+			: std::sqrt(static_cast<float>(h.n_embd));
+		nnc_embed_row_bf16(xp, f.token_embd->data, token_id,
 		                   static_cast<size_t>(h.n_embd), embd_scale);
 
 		if (ple_dim > 0 && f.per_layer_token_embd && f.per_layer_model_proj && f.per_layer_proj_norm)
 		{
+			float* ple_inputs = cache.sple_inputs.data();
+			float* bproj = cache.sple_proj.data();
+
 			const float tok_scale = std::sqrt(static_cast<float>(ple_dim));
 			const nnc_bf16_t* row = static_cast<const nnc_bf16_t*>(f.per_layer_token_embd->data)
 				+ static_cast<size_t>(token_id) * static_cast<size_t>(ple_total);
-			nnc_bf16_to_f32_row(row, bple_inputs.data(), static_cast<size_t>(ple_total));
-			for (int i = 0; i < ple_total; ++i) bple_inputs[i] *= tok_scale;
+			nnc_bf16_to_f32_row(row, ple_inputs, static_cast<size_t>(ple_total));
+			for (int i = 0; i < ple_total; ++i) ple_inputs[i] *= tok_scale;
 
-			std::vector<float> bproj(ple_total);
-			nnc_gemv_bf16w_f32x(f.per_layer_model_proj->data, x_out.data(), bproj.data(),
-			                    static_cast<uint32_t>(ple_total),
-			                    static_cast<uint32_t>(h.n_embd));
+			gw_gemv(f.per_layer_model_proj, xp, bproj);
 			const float inv_sqrt_n_embd = 1.0f / std::sqrt(static_cast<float>(h.n_embd));
 			for (int i = 0; i < ple_total; ++i) bproj[i] *= inv_sqrt_n_embd;
 
-			auto gamma = static_cast<const float*>(f.per_layer_proj_norm->data);
+			const auto gamma = static_cast<const float*>(f.per_layer_proj_norm->data);
 			for (int li = 0; li < h.n_layer; ++li)
 			{
-				float* slc = bproj.data() + static_cast<size_t>(li) * ple_dim;
+				float* slc = bproj + static_cast<size_t>(li) * ple_dim;
 				rmsnorm_with_gamma(slc, slc, ple_dim, gamma, h.rms_eps);
 			}
 
 			const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
 			for (int i = 0; i < ple_total; ++i)
-				bple_inputs[i] = (bproj[i] + bple_inputs[i]) * inv_sqrt2;
+				ple_inputs[i] = (bproj[i] + ple_inputs[i]) * inv_sqrt2;
 		}
+
+		// layer_forward expects a std::vector<float>& for the residual
+		// stream. Wrap our cached buffer in a non-owning view; we never
+		// resize it inside the loop.
+		// To avoid touching layer_forward's signature, use a
+		// std::vector that aliases cache.sx in place of the per-call
+		// allocation. The simplest correct option is to operate on
+		// cache.sx directly via a small adapter that exposes data().
+		// We reuse cache.sx as the actual storage by passing a
+		// reference to it.
+		std::vector<float>& xv = cache.sx;
 
 		for (int li = 0; li < h.n_layer; ++li)
 		{
 			s.ple_for_layer = (ple_dim > 0 && f.per_layer_token_embd)
-				                  ? bple_inputs.data() + static_cast<size_t>(li) * ple_dim
+				                  ? cache.sple_inputs.data() + static_cast<size_t>(li) * ple_dim
 				                  : nullptr;
-			layer_forward(f, cache, li, pos, x_out, s);
+			layer_forward(f, cache, li, pos, xv, s);
 		}
 
 		if (f.output_norm)
-			rmsnorm_with_gamma(x_out.data(), x_out.data(), h.n_embd,
+			rmsnorm_with_gamma(xp, xp, h.n_embd,
 			                   static_cast<const float*>(f.output_norm->data), h.rms_eps);
 
 		return 0;
@@ -930,16 +1202,14 @@ namespace
 }
 
 int gemma_eval_token(const gemma_file& f, gemma_kv_cache& cache,
-                     int token_id, int pos, float* logits)
+                     const int token_id, const int pos, float* logits)
 {
 	const auto& h = f.hparams;
-	std::vector<float> x;
-	const int rc = gemma_forward_to_x(f, cache, token_id, pos, x);
+	const int rc = gemma_forward_to_x(f, cache, token_id, pos);
 	if (rc != 0) return rc;
 
-	nnc_gemv_bf16w_f32x(f.token_embd->data, x.data(), logits,
-	                    static_cast<uint32_t>(h.n_vocab),
-	                    static_cast<uint32_t>(h.n_embd));
+	const nnc_tensor* lm_head = f.output ? f.output : f.token_embd;
+	gw_gemv(lm_head, cache.sx.data(), logits);
 	if (h.final_logit_softcap > 0)
 		nnc_softcap_f32(logits, logits, h.n_vocab, h.final_logit_softcap);
 
@@ -952,17 +1222,14 @@ int gemma_eval_token(const gemma_file& f, gemma_kv_cache& cache,
 // by greedy decode (the chat REPL and gemma_generate). Soft-cap is
 // monotonic so it has no effect on argmax and is skipped.
 int gemma_eval_token_argmax(const gemma_file& f, gemma_kv_cache& cache,
-                            int token_id, int pos, int* out_argmax)
+                            const int token_id, const int pos, int* out_argmax)
 {
 	const auto& h = f.hparams;
-	std::vector<float> x;
-	const int rc = gemma_forward_to_x(f, cache, token_id, pos, x);
+	const int rc = gemma_forward_to_x(f, cache, token_id, pos);
 	if (rc != 0) return rc;
 
-	const int best = nnc_gemv_bf16w_argmax_f32x(
-		f.token_embd->data, x.data(),
-		static_cast<uint32_t>(h.n_vocab),
-		static_cast<uint32_t>(h.n_embd));
+	const nnc_tensor* lm_head = f.output ? f.output : f.token_embd;
+	const int best = gw_argmax(lm_head, cache.sx.data());
 
 	cache.cur_pos = pos + 1;
 	if (out_argmax) *out_argmax = best;
@@ -982,7 +1249,8 @@ int gemma_generate(const gemma_file& f, const std::vector<int>& prompt_tokens,
 		return 1;
 	}
 	const auto& h = f.hparams;
-	if (static_cast<int>(prompt_tokens.size()) + n_predict > n_ctx)
+	if (n_predict < 0 || n_ctx <= 0 ||
+		prompt_tokens.size() > static_cast<size_t>(n_ctx - n_predict))
 	{
 		fprintf(stderr, "gemma_generate: prompt(%zu) + n_predict(%d) > n_ctx(%d)\n",
 		        prompt_tokens.size(), n_predict, n_ctx);
@@ -1158,6 +1426,63 @@ namespace
 		return out;
 	}
 
+	// GPT-2 byte-to-unicode mapping. Each byte 0..255 maps to a printable
+	// Unicode codepoint, encoded as UTF-8. This is the same mapping as
+	// the original GPT-2 BPE tokenizer (and Llama-3's, which derives from it).
+	const std::array<std::string, 256>& byte_to_unicode_table()
+	{
+		static const auto table = []
+		{
+			std::array<std::string, 256> t;
+			// Printable ranges that map to themselves: '!'..'~', '¡'..'¬', '®'..'ÿ'.
+			std::vector<int> bs;
+			for (int b = '!'; b <= '~'; ++b) bs.push_back(b);
+			for (int b = 0xA1; b <= 0xAC; ++b) bs.push_back(b);
+			for (int b = 0xAE; b <= 0xFF; ++b) bs.push_back(b);
+			std::vector<int> cs = bs;
+			int n = 0;
+			for (int b = 0; b < 256; ++b)
+			{
+				if (std::find(bs.begin(), bs.end(), b) == bs.end())
+				{
+					bs.push_back(b);
+					cs.push_back(256 + n);
+					++n;
+				}
+			}
+			auto encode_utf8 = [](int cp) -> std::string
+			{
+				std::string s;
+				if (cp < 0x80) { s.push_back((char)cp); }
+				else if (cp < 0x800)
+				{
+					s.push_back((char)(0xC0 | (cp >> 6)));
+					s.push_back((char)(0x80 | (cp & 0x3F)));
+				}
+				else
+				{
+					s.push_back((char)(0xE0 | (cp >> 12)));
+					s.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+					s.push_back((char)(0x80 | (cp & 0x3F)));
+				}
+				return s;
+			};
+			for (size_t i = 0; i < bs.size(); ++i)
+				t[bs[i]] = encode_utf8(cs[i]);
+			return t;
+		}();
+		return table;
+	}
+
+	std::string bytes_to_unicode(const std::string& in)
+	{
+		const auto& tab = byte_to_unicode_table();
+		std::string out;
+		out.reserve(in.size() * 2);
+		for (unsigned char b : in) out.append(tab[b]);
+		return out;
+	}
+
 	std::string restore_spaces(const std::string& in)
 	{
 		std::string out;
@@ -1190,9 +1515,151 @@ std::vector<int> gemma_tokenize(const gemma_file& f, const std::string& text,
 
 	if (text.empty()) return out;
 
+	// GPT-2 / Llama BPE path (tokenizer.ggml.model="gpt2"): byte-to-unicode
+	// encode input, then merge by rank from merges[]. We skip the GPT-4
+	// pretokenize regex; for chat-style English input the merges naturally
+	// resolve word boundaries via 'Ġ' (= encoded space) prefixes.
+	if (f.tokenizer_model == "gpt2" && !f.merges.empty())
+	{
+		const std::string enc = bytes_to_unicode(text);
+		std::vector<std::string> pieces;
+		split_utf8_codepoints(enc, pieces);
+
+		auto pair_key = [](const std::string& a, const std::string& b)
+		{
+			std::string k;
+			k.reserve(a.size() + 1 + b.size());
+			k.append(a);
+			k.push_back(' ');
+			k.append(b);
+			return k;
+		};
+
+		while (pieces.size() >= 2)
+		{
+			int best_rank = std::numeric_limits<int>::max();
+			size_t best_i = pieces.size();
+			for (size_t i = 0; i + 1 < pieces.size(); ++i)
+			{
+				auto it = f.merge_rank.find(pair_key(pieces[i], pieces[i + 1]));
+				if (it != f.merge_rank.end() && it->second < best_rank)
+				{
+					best_rank = it->second;
+					best_i = i;
+				}
+			}
+			if (best_i == pieces.size()) break;
+			pieces[best_i] = pieces[best_i] + pieces[best_i + 1];
+			pieces.erase(pieces.begin() + best_i + 1);
+		}
+
+		out.reserve(out.size() + pieces.size());
+		for (const auto& p : pieces)
+		{
+			auto it = f.token_to_id.find(p);
+			if (it != f.token_to_id.end())
+				out.push_back(it->second);
+			else if (f.unk_id >= 0)
+				out.push_back(f.unk_id);
+		}
+		return out;
+	}
+
 	// Optional leading-space rule (Gemma 3n: add_space_prefix=false, so off).
 	std::string s = f.add_space_prefix ? (std::string(" ") + text) : text;
 	s = sub_spaces(s);
+
+	// SentencePiece-BPE path (tokenizer.ggml.model="llama"): priority-merge
+	// adjacent symbols by vocab score (higher = merge first). Used by gemma3
+	// and llama models. Falls back to <0xHH> byte tokens for unknown bytes.
+	if (f.merges.empty() && !f.vocab_scores.empty())
+	{
+		// Pre-split into UTF-8 codepoint symbols, kept as a doubly-linked
+		// list via prev/next index arrays so we can erase merged pairs in
+		// O(1).
+		std::vector<std::string> sym;
+		split_utf8_codepoints(s, sym);
+		const int N = (int)sym.size();
+		std::vector<int> prev(N), next(N);
+		for (int i = 0; i < N; ++i) { prev[i] = i - 1; next[i] = i + 1; }
+		next[N - 1] = -1;
+
+		struct Bigram
+		{
+			float score;
+			int left;   // index of left symbol
+			int rev;    // revision counter to invalidate stale entries
+			size_t len; // total bytes
+			bool operator<(const Bigram& o) const
+			{
+				if (score != o.score) return score < o.score; // max-heap
+				return left > o.left; // tie-break: leftmost first
+			}
+		};
+		std::priority_queue<Bigram> pq;
+		std::vector<int> rev(N, 0);
+
+		auto try_push = [&](int left)
+		{
+			if (left < 0) return;
+			const int right = next[left];
+			if (right < 0) return;
+			std::string merged = sym[left] + sym[right];
+			auto it = f.token_to_id.find(merged);
+			if (it == f.token_to_id.end()) return;
+			const int id = it->second;
+			const float sc = (id >= 0 && id < (int)f.vocab_scores.size())
+				                 ? f.vocab_scores[id]
+				                 : 0.0f;
+			pq.push({sc, left, rev[left], merged.size()});
+		};
+
+		for (int i = 0; i + 1 < N; ++i) try_push(i);
+
+		while (!pq.empty())
+		{
+			Bigram b = pq.top();
+			pq.pop();
+			if (b.rev != rev[b.left]) continue;          // stale
+			const int right = next[b.left];
+			if (right < 0) continue;                     // stale
+			if (sym[b.left].size() + sym[right].size() != b.len) continue; // stale
+
+			sym[b.left] = sym[b.left] + sym[right];
+			rev[b.left]++;
+			// unlink right
+			const int rr = next[right];
+			next[b.left] = rr;
+			if (rr >= 0) prev[rr] = b.left;
+			// invalidate right
+			rev[right] = -1;
+			// push new bigrams on either side of merged left
+			try_push(b.left);
+			try_push(prev[b.left]);
+		}
+
+		// Walk the final linked list, emitting ids (with byte fallback).
+		for (int i = 0; i >= 0 && i < N; i = next[i])
+		{
+			if (rev[i] < 0) continue;
+			auto it = f.token_to_id.find(sym[i]);
+			if (it != f.token_to_id.end())
+			{
+				out.push_back(it->second);
+				continue;
+			}
+			// Byte fallback per UTF-8 byte.
+			for (unsigned char c : sym[i])
+			{
+				char hex[8];
+				std::snprintf(hex, sizeof(hex), "<0x%02X>", (unsigned)c);
+				auto bt = f.token_to_id.find(hex);
+				if (bt != f.token_to_id.end()) out.push_back(bt->second);
+				else if (f.unk_id >= 0) out.push_back(f.unk_id);
+			}
+		}
+		return out;
+	}
 
 	// Split into codepoint pieces.
 	std::vector<std::string> pieces;
@@ -1232,8 +1699,28 @@ std::vector<int> gemma_tokenize(const gemma_file& f, const std::string& text,
 	for (const auto& p : pieces)
 	{
 		auto it = f.token_to_id.find(p);
-		if (it != f.token_to_id.end()) out.push_back(it->second);
-		else out.push_back(f.unk_id >= 0 ? f.unk_id : 0);
+		if (it != f.token_to_id.end())
+		{
+			out.push_back(it->second);
+		}
+		else if (f.unk_id >= 0)
+		{
+			out.push_back(f.unk_id);
+		}
+		else
+		{
+			// No unk_id configured — warn (once per call) and substitute id 0
+			// rather than silently turning unknown pieces into a real token.
+			thread_local bool warned = false;
+			if (!warned)
+			{
+				fprintf(stderr,
+				        "warning: no unk_id in vocab; unknown piece '%s' -> 0\n",
+				        p.c_str());
+				warned = true;
+			}
+			out.push_back(0);
+		}
 	}
 	return out;
 }
@@ -1247,5 +1734,123 @@ std::string gemma_detokenize(const gemma_file& f, const std::vector<int>& tokens
 		if (t < 0 || t >= static_cast<int>(f.vocab_tokens.size())) continue;
 		acc.append(f.vocab_tokens[t]);
 	}
+	if (f.tokenizer_model == "gpt2")
+	{
+		// Reverse byte-to-unicode mapping: walk the encoded string,
+		// pull off one Unicode codepoint at a time, and emit the byte
+		// it represents.
+		const auto& tab = byte_to_unicode_table();
+		std::unordered_map<std::string, unsigned char> rev;
+		for (int b = 0; b < 256; ++b) rev.emplace(tab[b], (unsigned char)b);
+		std::string out;
+		out.reserve(acc.size());
+		size_t i = 0;
+		while (i < acc.size())
+		{
+			const int n = utf8_len((unsigned char)acc[i]);
+			const size_t take = (i + n <= acc.size()) ? n : (acc.size() - i);
+			std::string cp(acc.data() + i, take);
+			auto it = rev.find(cp);
+			if (it != rev.end()) out.push_back((char)it->second);
+			else out.append(cp); // fallback: pass through (e.g. special tokens)
+			i += take;
+		}
+		return out;
+	}
 	return restore_spaces(acc);
+}
+
+// ----------------------------------------------------------------------------
+// Q8_0 in-place quantisation. Walks the weight tensors that dominate the
+// decode/prefill GEMV time, replaces their `data` pointer with a fresh Q8_0
+// allocation (qs[] then scales[]), and flips `tensor->type`. Subsequent
+// calls to gw_gemv / gw_argmax then route through nnc_gemv_q8_0_f32x.
+// ----------------------------------------------------------------------------
+
+namespace
+{
+	// Quantise a single BF16 [rows, cols] weight tensor in place. Returns
+	// false on allocation failure or unsupported shape (cols not a positive
+	// multiple of 32). `label` is for the optional log line.
+	bool quantize_one(gemma_file& f, nnc_tensor* T, const char* label,
+	                  size_t& bf16_bytes, size_t& q8_bytes)
+	{
+		if (!T) return true; // missing optional tensor
+		if (T->type != NNC_TYPE_BF16) return true; // already converted / unsupported
+		if (T->n_dims != 2) return true;
+		const int64_t cols = T->ne[0];
+		const int64_t rows = T->ne[1];
+		if (cols <= 0 || rows <= 0 || (cols % 32) != 0) return true;
+
+		const size_t qs_bytes = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+		const size_t scales_count = static_cast<size_t>(rows) * static_cast<size_t>(cols / 32);
+		const size_t total = qs_bytes + scales_count * sizeof(float);
+
+		auto buf = std::unique_ptr<uint8_t[]>(new(std::nothrow) uint8_t[total]);
+		if (!buf)
+		{
+			fprintf(stderr, "gemma_quantize_q8_0: alloc %zu bytes failed for %s\n",
+			        total, label ? label : "<tensor>");
+			return false;
+		}
+		auto* qs = reinterpret_cast<int8_t*>(buf.get());
+		auto* scales = reinterpret_cast<float*>(buf.get() + qs_bytes);
+
+		nnc_quantize_bf16_to_q8_0(static_cast<const nnc_bf16_t*>(T->data),
+		                          qs, scales,
+		                          static_cast<uint32_t>(rows),
+		                          static_cast<uint32_t>(cols));
+
+		bf16_bytes += qs_bytes * 2; // BF16 was 2 bytes/elem
+		q8_bytes += total;
+
+		T->data = buf.get();
+		T->type = NNC_TYPE_Q8_0;
+		f.q8_buffers.push_back(std::move(buf));
+		return true;
+	}
+}
+
+bool gemma_quantize_q8_0(gemma_file& f)
+{
+	size_t bf16_bytes = 0, q8_bytes = 0;
+	int n_quant = 0;
+
+	auto take = [&](nnc_tensor* T, const char* label) -> bool
+	{
+		const bool was_bf16 = (T && T->type == NNC_TYPE_BF16);
+		if (!quantize_one(f, T, label, bf16_bytes, q8_bytes)) return false;
+		if (was_bf16 && T->type == NNC_TYPE_Q8_0) ++n_quant;
+		return true;
+	};
+
+	for (const auto& L : f.layers)
+	{
+		if (!take(L.attn_q, "attn_q")) return false;
+		if (!take(L.attn_k, "attn_k")) return false;
+		if (!take(L.attn_v, "attn_v")) return false;
+		if (!take(L.attn_output, "attn_output")) return false;
+		if (!take(L.ffn_gate, "ffn_gate")) return false;
+		if (!take(L.ffn_up, "ffn_up")) return false;
+		if (!take(L.ffn_down, "ffn_down")) return false;
+		// PLE per-layer projections: small but keep them BF16-or-Q8 uniform.
+		if (!take(L.inp_gate, "inp_gate")) return false;
+		if (!take(L.proj, "proj")) return false;
+	}
+	// NOTE: f.token_embd is intentionally NOT quantised. It doubles as the
+	// input embedding table (read via nnc_embed_row_bf16) AND the lm_head
+	// projection. The embedding-lookup path expects raw BF16 rows; flipping
+	// the type to Q8_0 would feed garbage into x. Cost: lm_head stays BF16
+	// (~17% of decode), so the realised speedup is below the theoretical
+	// 1.78x BW reduction.
+	if (!take(f.per_layer_model_proj, "per_layer_model_proj")) return false;
+	// llama-style separate lm_head: safe to quantize (not used as embedding lookup).
+	if (!take(f.output, "output")) return false;
+
+	const double bf16_mb = static_cast<double>(bf16_bytes) / (1024.0 * 1024.0);
+	const double q8_mb = static_cast<double>(q8_bytes) / (1024.0 * 1024.0);
+	fprintf(stderr, "gemma_quantize_q8_0: %d tensors, %.1f MB BF16 -> %.1f MB Q8_0 (%.2fx)\n",
+	        n_quant, bf16_mb, q8_mb,
+	        bf16_bytes ? (bf16_mb / q8_mb) : 0.0);
+	return true;
 }

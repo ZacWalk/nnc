@@ -65,6 +65,7 @@ namespace
 	{
 		jit_buffer buf;
 		x64_emitter e(buf);
+		e.emit_win64_arg_shuffle(2); // (a, b)
 		e.lea_r32_base_index(gpr::rax, gpr::rcx, gpr::rdx);
 		e.ret();
 		using fn_t = int (*)(int, int);
@@ -618,7 +619,10 @@ namespace
 	{
 		std::mt19937 rng(0xA12A);
 		std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-		struct sh { uint32_t rows, cols; };
+		struct sh
+		{
+			uint32_t rows, cols;
+		};
 		// Cover the fast path (rows%4==0, cols%8==0) plus the fallback.
 		const sh shapes[] = {
 			{4, 32}, {16, 256}, {2048, 256}, {256, 1536}, {7, 5},
@@ -665,6 +669,249 @@ namespace
 					            s.rows, s.cols);
 					return false;
 				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: q8_0 quantize roundtrip + gemv ---------------------------
+
+	bool test_nnc_q8_0_quantize_roundtrip()
+	{
+		// Quantize a synthetic BF16 row and verify the recovered (scale*q)
+		// values are within absmax/127 of the original — i.e. the worst
+		// per-element error is bounded by the per-block step size.
+		std::mt19937 rng(0xC0FFEE);
+		std::uniform_real_distribution<float> d(-2.5f, 2.5f);
+		constexpr size_t rows = 3, cols = 64;
+		std::vector<nnc_bf16_t> W(rows * cols);
+		std::vector<float> Wf(rows * cols);
+		for (size_t i = 0; i < W.size(); ++i)
+		{
+			Wf[i] = d(rng);
+			W[i] = nnc_f32_to_bf16(Wf[i]);
+			Wf[i] = nnc_bf16_to_f32(W[i]); // re-quantize for fair compare
+		}
+		std::vector<int8_t> qs(rows * cols);
+		std::vector<float> scales(rows * (cols / 32));
+		nnc_quantize_bf16_to_q8_0(W.data(), qs.data(), scales.data(), rows, cols);
+
+		for (size_t r = 0; r < rows; ++r)
+		{
+			for (size_t b = 0; b < cols / 32; ++b)
+			{
+				const float scale = scales[r * (cols / 32) + b];
+				// Step size = scale; allow one step of error.
+				for (size_t k = 0; k < 32; ++k)
+				{
+					const float got = scale * static_cast<float>(qs[r * cols + b * 32 + k]);
+					const float ref = Wf[r * cols + b * 32 + k];
+					if (std::fabs(got - ref) > scale + 1e-6f)
+					{
+						std::printf("    q8_0 roundtrip r=%zu b=%zu k=%zu got=%g ref=%g scale=%g\n",
+						            r, b, k, got, ref, scale);
+						return false;
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	bool test_nnc_gemv_q8_0_f32x()
+	{
+		// Quantize a BF16 weight matrix, run JIT Q8_0 gemv, and compare
+		// to a scalar reference computed from the SAME quantized weights
+		// (so the only error source is FMA reorder vs scalar order).
+		std::mt19937 rng(0xC8E2);
+		std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+		struct sh
+		{
+			uint32_t rows, cols;
+		};
+		// cover small (single-thread) and parallel paths.
+		const sh shapes[] = {
+			{1, 32}, {8, 64}, {64, 128},
+			{256, 256}, {512, 512}, {2048, 2048},
+		};
+		for (const auto s : shapes)
+		{
+			std::vector<nnc_bf16_t> W(static_cast<size_t>(s.rows) * s.cols);
+			for (auto& w : W) w = nnc_f32_to_bf16(d(rng));
+
+			std::vector<int8_t> qs(W.size());
+			std::vector<float> scales(static_cast<size_t>(s.rows) * (s.cols / 32));
+			nnc_quantize_bf16_to_q8_0(W.data(), qs.data(), scales.data(),
+			                          s.rows, s.cols);
+
+			std::vector<float> x(s.cols), y(s.rows), ref(s.rows);
+			for (auto& v : x) v = d(rng);
+
+			nnc_gemv_q8_0_f32x(qs.data(), scales.data(), x.data(), y.data(),
+			                   s.rows, s.cols);
+
+			// Reference: dequantize then dot, in double precision.
+			const size_t scale_stride = s.cols / 32;
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				double acc = 0.0;
+				for (uint32_t b = 0; b < scale_stride; ++b)
+				{
+					const float scale = scales[r * scale_stride + b];
+					for (uint32_t k = 0; k < 32; ++k)
+					{
+						const float w = scale * qs[r * s.cols + b * 32 + k];
+						acc += static_cast<double>(w) * x[b * 32 + k];
+					}
+				}
+				ref[r] = static_cast<float>(acc);
+			}
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				const float tol = 1e-3f * std::max(1.0f, std::fabs(ref[r]));
+				if (std::fabs(y[r] - ref[r]) > tol)
+				{
+					std::printf("    q8_0 gemv r=%u y=%g ref=%g (rows=%u cols=%u)\n",
+					            r, y[r], ref[r], s.rows, s.cols);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: K-quant dequantizers ------------------------------------
+
+	// Helper: build a Q4_K block where every super-scale = 1, every
+	// sub-block scale = 1 and min = 0, so dequant(qs) == per-nibble
+	// integer values. Returns a 144-byte block image.
+	void build_q4k_unit_block(uint8_t out[144], const uint8_t qs[128])
+	{
+		std::memset(out, 0, 144);
+		const uint16_t one_h = fp32_to_fp16(1.0f);
+		std::memcpy(out + 0, &one_h, 2); // d
+		// dmin = 0 (already memset)
+		uint8_t* sc = out + 4;
+		// sub-blocks 0..3: scale in low 6 of sc[0..3]; min = 0 in sc[4..7].
+		sc[0] = 1; sc[1] = 1; sc[2] = 1; sc[3] = 1;
+		// sub-blocks 4..7: scale low 4 in sc[8..11], min in sc[8..11]>>4.
+		// High 2 bits of scale come from sc[0..3]>>6 (=0). Want scale=1.
+		sc[8] = 0x01; sc[9] = 0x01; sc[10] = 0x01; sc[11] = 0x01;
+		std::memcpy(out + 16, qs, 128);
+	}
+
+	bool test_nnc_dequantize_q4_k()
+	{
+		// qs[i] = 0x21 for all i: low nibble = 1, high nibble = 2.
+		uint8_t qs[128];
+		std::memset(qs, 0x21, sizeof(qs));
+		uint8_t blk[144];
+		build_q4k_unit_block(blk, qs);
+
+		float out[256];
+		nnc_dequantize_q4_k_to_f32(blk, out, 256);
+
+		// Each of the 4 outer iterations writes 64 outputs:
+		// 32 from low nibble (=1), 32 from high nibble (=2).
+		for (int j = 0; j < 4; ++j)
+		{
+			for (int k = 0; k < 32; ++k)
+				if (out[j * 64 + k] != 1.0f) return false;
+			for (int k = 0; k < 32; ++k)
+				if (out[j * 64 + 32 + k] != 2.0f) return false;
+		}
+		return true;
+	}
+
+	bool test_nnc_dequantize_q5_k()
+	{
+		// Same scale/min layout as Q4_K, plus qh: 1 bit per element
+		// across all 4 outer iterations (u1,u2 walk bits 0/1, 2/3, 4/5, 6/7).
+		uint8_t blk[176];
+		std::memset(blk, 0, sizeof(blk));
+		const uint16_t one_h = fp32_to_fp16(1.0f);
+		std::memcpy(blk + 0, &one_h, 2); // d
+		uint8_t* sc = blk + 4;
+		sc[0] = sc[1] = sc[2] = sc[3] = 1;
+		sc[8] = sc[9] = sc[10] = sc[11] = 0x01;
+		uint8_t* qh = blk + 16;
+		uint8_t* qs = blk + 16 + 32;
+
+		// Case 1: qh all zero → no +16, output identical to Q4_K test.
+		std::memset(qh, 0x00, 32);
+		std::memset(qs, 0x21, 128);
+
+		float out[256];
+		nnc_dequantize_q5_k_to_f32(blk, out, 256);
+		for (int j = 0; j < 4; ++j)
+		{
+			for (int k = 0; k < 32; ++k) if (out[j * 64 + k] != 1.0f) return false;
+			for (int k = 0; k < 32; ++k) if (out[j * 64 + 32 + k] != 2.0f) return false;
+		}
+
+		// Case 2: qh all 0xFF → every element gets +16 added.
+		std::memset(qh, 0xFF, 32);
+		nnc_dequantize_q5_k_to_f32(blk, out, 256);
+		for (int j = 0; j < 4; ++j)
+		{
+			for (int k = 0; k < 32; ++k) if (out[j * 64 + k] != 17.0f) return false;
+			for (int k = 0; k < 32; ++k) if (out[j * 64 + 32 + k] != 18.0f) return false;
+		}
+		return true;
+	}
+
+	bool test_fp16_subnormal_dequant()
+	{
+		// Regression: fp16 subnormal decode previously had an off-by-one
+		// that produced values 2x too small. K-quant `d` super-block scales
+		// frequently land in subnormal range, biasing dequanted weights.
+		//
+		// Build a Q4_K block with d = smallest subnormal half (0x0001
+		// = 2^-24), dmin = 0, sub-block scale[0] = 1, qs low nibble = 1.
+		// Then y[0] should be 1 * d * 1 - 0 = 2^-24 ≈ 5.96e-8.
+		uint8_t blk[144];
+		std::memset(blk, 0, sizeof(blk));
+		const uint16_t d_smallest_subnormal = 0x0001; // 2^-24
+		std::memcpy(blk + 0, &d_smallest_subnormal, 2);
+		// dmin = 0 (already)
+		blk[4] = 1; // scales[0] = sc=1, mn=0
+		blk[8] = 0; // scales[8..11] = 0 (unused for j<4)
+		std::memset(blk + 16, 0x11, 128); // qs: low=1, high=1
+
+		float out[256];
+		nnc_dequantize_q4_k_to_f32(blk, out, 256);
+		const float expected = std::ldexp(1.0f, -24); // 2^-24
+		// Tight relative tolerance — decode should be exact.
+		const float err = std::fabs(out[0] - expected);
+		return err < 1e-12f;
+	}
+
+	bool test_nnc_dequantize_q6_k()
+	{
+		// d = 1, all 16 sub-block scales = 1, ql = 0x10 (low nibble 0,
+		// high nibble 1), qh = 0 (top 2 bits of every quant = 0). Then
+		// q1 = q2 = 0 - 32 = -32; q3 = q4 = 1 - 32 = -31.
+		uint8_t blk[210];
+		std::memset(blk, 0, sizeof(blk));
+		std::memset(blk + 0, 0x10, 128); // ql
+		// qh already zeroed
+		std::memset(blk + 128 + 64, 1, 16); // scales (i8) = 1
+		const uint16_t one_h = fp32_to_fp16(1.0f);
+		std::memcpy(blk + 208, &one_h, 2); // d
+
+		float out[256];
+		nnc_dequantize_q6_k_to_f32(blk, out, 256);
+
+		// For each of 2 outer iters writing 128 outputs:
+		//   y[l +  0] = -32, y[l + 32] = -32, y[l + 64] = -31, y[l + 96] = -31
+		for (int n = 0; n < 256; n += 128)
+		{
+			for (int l = 0; l < 32; ++l)
+			{
+				if (out[n + l + 0] != -32.0f) return false;
+				if (out[n + l + 32] != -32.0f) return false;
+				if (out[n + l + 64] != -31.0f) return false;
+				if (out[n + l + 96] != -31.0f) return false;
 			}
 		}
 		return true;
@@ -839,6 +1086,12 @@ int run_tests()
 	report("bf16_to_f32_row", test_bf16_to_f32_row());
 	report("nnc_gemv_bf16w_f32x", test_nnc_gemv_bf16w_f32x());
 	report("nnc_gemv_bf16w_argmax_f32x", test_nnc_gemv_bf16w_argmax_f32x());
+	report("nnc_q8_0_quantize_roundtrip", test_nnc_q8_0_quantize_roundtrip());
+	report("nnc_gemv_q8_0_f32x", test_nnc_gemv_q8_0_f32x());
+	report("nnc_dequantize_q4_k", test_nnc_dequantize_q4_k());
+	report("nnc_dequantize_q5_k", test_nnc_dequantize_q5_k());
+	report("fp16_subnormal_dequant", test_fp16_subnormal_dequant());
+	report("nnc_dequantize_q6_k", test_nnc_dequantize_q6_k());
 	report("nnc_swiglu_f32", test_nnc_swiglu_f32());
 	report("nnc_rope_f32", test_nnc_rope_f32());
 	report("nnc_softcap_f32", test_nnc_softcap_f32());

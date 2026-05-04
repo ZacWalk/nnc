@@ -25,6 +25,12 @@ enum nnc_type
 	NNC_TYPE_F16 = 1,
 	NNC_TYPE_I32 = 2,
 	NNC_TYPE_BF16 = 3,
+	// Q8_0 (split layout): row r of an [rows x cols] weight matrix is
+	// stored as `int8 qs[rows*cols]` followed by `float scales[rows*cols/32]`
+	// in the same allocation. `tensor->data` points at `qs`; the kernel
+	// computes the scales pointer from rows*cols. Block size is 32; the
+	// quantizer fills cols-multiple-of-32 only.
+	NNC_TYPE_Q8_0 = 4,
 	NNC_TYPE_COUNT,
 };
 
@@ -107,7 +113,7 @@ float nnc_type_sizef(nnc_type t);
 int nnc_blck_size(nnc_type t);
 size_t nnc_element_size(const struct nnc_tensor* t);
 size_t nnc_nbytes(const struct nnc_tensor* t);
-int nnc_nelements(const struct nnc_tensor* t);
+int64_t nnc_nelements(const struct nnc_tensor* t);
 void* nnc_get_data(const struct nnc_tensor* t);
 
 // --- tensor builders (allocate into the arena) ---

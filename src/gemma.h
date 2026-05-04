@@ -13,6 +13,7 @@
 #include "gguf.h"
 #include "runtime.h"
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,11 +67,14 @@ struct gemma_hparams
 	int rope_dim_swa = 0; // gemma4.rope.dimension_count_swa
 	float rope_freq_base = 0; // gemma4.rope.freq_base
 	float rope_freq_base_swa = 0; // gemma4.rope.freq_base_swa
+	float rope_freq_scale = 1; // 1/rope.scaling.factor (linear scaling)
 	float rms_eps = 0; // gemma4.attention.layer_norm_rms_epsilon
 	int sliding_window = 0; // gemma4.attention.sliding_window
+	int sliding_window_period = 0; // every Nth layer is global (gemma3)
 	int shared_kv_layers = 0; // gemma4.attention.shared_kv_layers
 	int ple_dim = 0; // gemma4.embedding_length_per_layer_input
 	float final_logit_softcap = 0; // gemma4.final_logit_softcapping
+	float attention_scale = 1.0f; // gemma4.attention.scale (default 1)
 	int file_type = 0; // raw GGUF file_type (32 = mostly BF16)
 };
 
@@ -102,6 +106,8 @@ struct gemma_file
 	std::unordered_map<std::string, int> merge_rank; // "lhs rhs" -> rank
 	bool add_bos_token = true;
 	bool add_space_prefix = false;
+	std::string tokenizer_model; // tokenizer.ggml.model (e.g. "gemma4", "llama", "gpt2")
+	size_t max_token_bytes = 0; // longest piece in vocab (Unigram Viterbi cap)
 
 	// Top-level weights (BF16 unless noted).
 	nnc_tensor* token_embd = nullptr; // [n_embd, n_vocab]
@@ -109,6 +115,7 @@ struct gemma_file
 	nnc_tensor* per_layer_model_proj = nullptr; // [n_embd, ple_dim*n_layer]
 	nnc_tensor* per_layer_proj_norm = nullptr; // [ple_dim] (F32)
 	nnc_tensor* output_norm = nullptr; // [n_embd]  (F32; if absent, tied to token_embd norm)
+	nnc_tensor* output = nullptr;      // [n_embd, n_vocab]  llama lm_head; absent = tied to token_embd
 	nnc_tensor* rope_freqs = nullptr; // [rope_dim/2]  precomputed (F32)
 
 	std::vector<gemma_layer> layers;
@@ -116,7 +123,32 @@ struct gemma_file
 	// nnc context that owns the tensor descriptors (NOT the weight bytes,
 	// which live in the gguf mmap). Sized to fit ~601 tensor headers.
 	nnc_context* ctx = nullptr;
+
+	// Owned Q8_0 buffers (one per quantized tensor). When a weight is
+	// quantized in-place, its `tensor->data` is repointed at one of
+	// these allocations and `tensor->type` becomes NNC_TYPE_Q8_0. Layout:
+	// int8 qs[rows*cols] followed by float scales[rows*cols/32].
+	std::vector<std::unique_ptr<uint8_t[]>> q8_buffers;
+
+	// Owned dequant buffers for K-quant (Q4_K/Q5_K/Q6_K) weights read
+	// straight from disk. Each entry is a BF16 row-major weight image
+	// produced at load time by nnc_dequantize_kquant_to_f32 + f32->bf16.
+	// `tensor->data` for those tensors points into one of these. After
+	// gemma_load returns, the K-quant bytes in the GGUF mmap are no
+	// longer referenced by any tensor.
+	std::vector<std::unique_ptr<uint8_t[]>> dequant_buffers;
 };
+
+// Convert eligible BF16 weight tensors in `f` to the Q8_0 split layout.
+// Targets: per-layer Q/K/V/O, FFN gate/up/down, and the top-level
+// token_embd (which doubles as the lm_head). Only tensors whose
+// fast-dim (`cols = ne[0]`) is a positive multiple of 32 are converted;
+// anything else is left as BF16. Allocates ~half the model size of new
+// RAM (the mmapped BF16 bytes stay mapped until OS paging reclaims
+// them; we do not unmap them).
+//
+// Returns true on success, false if any allocation fails.
+bool gemma_quantize_q8_0(gemma_file& f);
 
 bool gemma_load(const std::string& path, gemma_file& out);
 void gemma_free(gemma_file& f);
@@ -152,6 +184,23 @@ struct gemma_kv_cache
 	std::vector<int> kv_dim_per_layer;
 	std::vector<std::vector<float>> k; // [n_layer][n_ctx * kv_dim_li]
 	std::vector<std::vector<float>> v;
+
+	// Per-token forward-pass scratch. Allocated once in gemma_kv_init,
+	// reused by every gemma_eval_token call. Sized to the maxima across
+	// all layers so the same buffers serve every layer in turn.
+	std::vector<float> sx; // [n_embd]
+	std::vector<float> snormed; // [n_embd]
+	std::vector<float> sq; // [max_q_dim]
+	std::vector<float> sk_cur; // [max_kv_dim]
+	std::vector<float> sv_cur; // [max_kv_dim]
+	std::vector<float> sattn; // [max_q_dim]
+	std::vector<float> sgate; // [max_ff]
+	std::vector<float> sup; // [max_ff]
+	std::vector<float> sscores; // [n_ctx]
+	std::vector<float> sple_gate; // [ple_dim]
+	std::vector<float> sple_contrib; // [n_embd]
+	std::vector<float> sple_inputs; // [ple_dim * n_layer]
+	std::vector<float> sple_proj; // [ple_dim * n_layer]
 };
 
 bool gemma_kv_init(const gemma_file& f, gemma_kv_cache& cache, int n_ctx);

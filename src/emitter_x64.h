@@ -63,6 +63,16 @@ public:
 	void push_r64(gpr r); // 50+rd  (low 8 only)
 	void pop_r64(gpr r); // 58+rd  (low 8 only)
 
+	// ---- ABI shim ------------------------------------------------------
+
+	// On Linux (System V x86-64), shuffle the first n integer arguments
+	// from the SysV registers (RDI, RSI, RDX, RCX) into the Windows x64
+	// registers (RCX, RDX, R8, R9). On Windows this is a no-op so the
+	// rest of every kernel can be written as if Win64 ABI is in force
+	// regardless of host OS. n_int_args must be in [0, 4]. Float args
+	// land in XMM0..XMM3 in both ABIs and need no shuffle.
+	void emit_win64_arg_shuffle(int n_int_args);
+
 	// ---- Control flow --------------------------------------------------
 
 	void jl_rel8(int8_t disp); // 7C cb

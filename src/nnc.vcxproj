@@ -181,6 +181,8 @@
     <ClCompile Include="jit_ops.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="nn_ops.cpp" />
+    <ClCompile Include="sys_win.cpp" />
+    <ClCompile Include="sys_linux.cpp" />
     <ClCompile Include="tests.cpp" />
     <ClCompile Include="utils.cpp" />
     <ClCompile Include="emitter_x64.cpp" />
@@ -194,6 +196,7 @@
     <ClInclude Include="jit_kernel.h" />
     <ClInclude Include="jit_ops.h" />
     <ClInclude Include="nn_ops.h" />
+    <ClInclude Include="sys.h" />
     <ClInclude Include="utils.h" />
     <ClInclude Include="emitter_x64.h" />
   </ItemGroup>

@@ -39,6 +39,9 @@ public:
 	// acc <- acc + a * [base + index*4]
 	void vfmadd231ps_ymm_mem_basex4(ymm acc, ymm a, gpr base, gpr index);
 
+	// acc <- acc + a * [base + index*4 + disp8]   (mod=01 SIB form)
+	void vfmadd231ps_ymm_mem_basex4_disp8(ymm acc, ymm a, gpr base, gpr index, int8_t disp);
+
 	// acc <- acc + a * b   (register-register form)
 	void vfmadd231ps_ymm_ymm_ymm(ymm acc, ymm a, ymm b);
 
@@ -59,6 +62,22 @@ public:
 
 	// ymm dst <- vpmovzxwd(xmmword [base + index*2 + disp32])  (mod=10 SIB)
 	void vpmovzxwd_ymm_load_basex2_disp32(ymm dst, gpr base, gpr index, int32_t disp);
+
+	// ymm dst <- vpmovsxbd(qword [base + index])  (8 i8 -> 8 i32, sign-ext)
+	void vpmovsxbd_ymm_load_basex1(ymm dst, gpr base, gpr index);
+
+	// ymm dst <- vpmovsxbd(qword [base + index + disp8])  (mod=01 SIB)
+	void vpmovsxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index, int8_t disp);
+
+	// ymm dst <- vbroadcastss(dword [base])  (one f32 -> 8 lanes)
+	// base must NOT be rsp/rbp/r12/r13 (those need SIB / explicit disp).
+	void vbroadcastss_ymm_load_base(ymm dst, gpr base);
+
+	// ymm dst <- vcvtdq2ps(ymm src)  (8 i32 -> 8 f32)
+	void vcvtdq2ps_ymm_ymm(ymm dst, ymm src);
+
+	// ymm dst <- vmulps(ymm a, ymm b)  (per-lane multiply)
+	void vmulps_ymm_ymm_ymm(ymm dst, ymm a, ymm b);
 
 	// ymm dst <- vpslld(ymm src, imm8)   (logical shift left, 32-bit lanes)
 	void vpslld_ymm_imm8(ymm dst, ymm src, uint8_t imm);
