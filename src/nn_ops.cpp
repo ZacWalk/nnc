@@ -1,8 +1,8 @@
 // nnc — neural-net op implementations.
-// Hand-written AVX2/FMA/F16C SIMD kernels (gelu, softmax, layernorm,
-// elementwise add) plus thin wrappers that route dot/gemv to JITted
-// kernels from jit_kernel.cpp. Also hosts the small graph-level fuser
-// that collapses mul_mat -> repeat(bias) -> add [-> gelu] chains.
+// Hand-written AVX2/FMA SIMD kernels (gelu, softmax, layernorm, rmsnorm,
+// rope, elementwise) plus thin wrappers that route the BF16 / Q8_0 gemvs
+// to JITted kernels from jit_kernel.cpp and parallelise them across a
+// small static worker pool.
 
 #include "nn_ops.h"
 
@@ -158,10 +158,10 @@ void nnc_gelu_f32(float* y, const float* x, const size_t n)
 	}
 }
 
-// ---- FP16 dot product --------------------------------------------------
+// ---- FP16 -> FP32 scalar decode ----------------------------------------
 
-// IEEE 754 binary16 -> binary32, software fallback (no F16C dependency).
-// Used only for the scalar leftover path; the JIT path uses VCVTPH2PS.
+// IEEE 754 binary16 -> binary32, software only (no F16C dependency).
+// Used by the K-quant dequantizers for their fp16 super-block scales.
 static inline float fp16_to_fp32_scalar(const uint16_t h)
 {
 	const uint32_t s = (h >> 15) & 0x1u;
@@ -211,17 +211,6 @@ static inline float fp16_to_fp32_scalar(const uint16_t h)
 	return f;
 }
 
-static float dot_f16_scalar(const uint16_t* x, const uint16_t* y, const size_t n)
-{
-	double s = 0.0;
-	for (size_t i = 0; i < n; ++i)
-	{
-		s += static_cast<double>(fp16_to_fp32_scalar(x[i]))
-			* static_cast<double>(fp16_to_fp32_scalar(y[i]));
-	}
-	return static_cast<float>(s);
-}
-
 namespace
 {
 	jit_kernel_cache& global_cache()
@@ -231,28 +220,16 @@ namespace
 	}
 }
 
-float nnc_dot_f16_to_f32(const void* x, const void* y, const size_t n)
-{
-	if (n == 0) return 0.0f;
-
-	if ((n & 31u) == 0 && n <= UINT32_MAX)
-	{
-		const auto fn = global_cache().get_dot_f16(static_cast<uint32_t>(n));
-		return fn(x, y);
-	}
-
-	return dot_f16_scalar(static_cast<const uint16_t*>(x),
-	                      static_cast<const uint16_t*>(y), n);
-}
-
 // ---- softmax (in place) ------------------------------------------------
 
 void nnc_softmax_f32_inplace(float* p, const size_t n)
 {
 	if (n == 0) return;
 
+	constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+
 	// Pass 1: find max via AVX2.
-	float m = -INFINITY;
+	float m = NEG_INF;
 	{
 		size_t i = 0;
 		if (n >= 8)
@@ -272,24 +249,27 @@ void nnc_softmax_f32_inplace(float* p, const size_t n)
 	}
 
 	// Pass 2: exp(p[i] - m), accumulate sum. AVX2 polynomial nnc_exp_ps
-	// keeps softmax fully vectorised. -INFINITY entries become 0 because
-	// nnc_exp_ps clamps to ~ln(FLT_MIN) and exp() of that underflows.
+	// keeps softmax fully vectorised. nnc_exp_ps clamps its argument to
+	// ~ln(FLT_MIN), so -INFINITY lanes would come out as ~1e-38 rather
+	// than 0; mask them explicitly to honour the causal-mask contract.
 	double sum = 0.0;
 	{
 		const __m256 vm = _mm256_set1_ps(m);
+		const __m256 vninf = _mm256_set1_ps(NEG_INF);
 		__m256 vsum = _mm256_setzero_ps();
 		size_t i = 0;
 		for (; i + 8 <= n; i += 8)
 		{
-			__m256 v = _mm256_loadu_ps(p + i);
-			v = nnc_exp_ps(_mm256_sub_ps(v, vm));
+			const __m256 raw = _mm256_loadu_ps(p + i);
+			__m256 v = nnc_exp_ps(_mm256_sub_ps(raw, vm));
+			v = _mm256_andnot_ps(_mm256_cmp_ps(raw, vninf, _CMP_EQ_OQ), v);
 			_mm256_storeu_ps(p + i, v);
 			vsum = _mm256_add_ps(vsum, v);
 		}
 		sum = static_cast<double>(hsum_ymm(vsum));
 		for (; i < n; ++i)
 		{
-			if (p[i] == -INFINITY)
+			if (p[i] == NEG_INF)
 			{
 				p[i] = 0.0f;
 			}
@@ -320,36 +300,48 @@ void nnc_softmax_f32_inplace(float* p, const size_t n)
 void nnc_attn_softmax_v_f32(float* out, float* scores, const float* V,
                             const size_t n_t, const size_t v_stride, const size_t head_dim)
 {
-	if (n_t == 0 || head_dim == 0) return;
+	nnc_attn_softmax_v_multi_f32(out, 0, scores, 0, V, n_t, v_stride, head_dim, 1);
+}
 
-	// Reuse the existing fully-vectorised softmax (max + AVX2 exp + scale).
-	nnc_softmax_f32_inplace(scores, n_t);
+void nnc_attn_softmax_v_multi_f32(float* out, const size_t out_stride,
+                                  float* scores, const size_t scores_stride,
+                                  const float* V, const size_t n_t,
+                                  const size_t v_stride, const size_t head_dim,
+                                  const size_t n_heads)
+{
+	if (n_t == 0 || head_dim == 0 || n_heads == 0) return;
 
-	// Weighted sum of V rows, written to `out` in a single sweep. The
-	// "first row writes, rest accumulate" trick removes the explicit
-	// memset(out) the unfused path required.
+	for (size_t h = 0; h < n_heads; ++h)
+		nnc_softmax_f32_inplace(scores + h * scores_stride, n_t);
+
+	// t outermost: one pass over V, reused across heads from L1. The
+	// "first row writes, rest accumulate" trick removes the memset of out.
 	for (size_t t = 0; t < n_t; ++t)
 	{
-		const float w = scores[t];
 		const float* vrow = V + t * v_stride;
-		const __m256 vw = _mm256_set1_ps(w);
-		size_t i = 0;
-		if (t == 0)
+		for (size_t h = 0; h < n_heads; ++h)
 		{
-			for (; i + 8 <= head_dim; i += 8)
-				_mm256_storeu_ps(out + i,
-				                 _mm256_mul_ps(vw, _mm256_loadu_ps(vrow + i)));
-			for (; i < head_dim; ++i) out[i] = w * vrow[i];
-		}
-		else
-		{
-			for (; i + 8 <= head_dim; i += 8)
+			const float w = scores[h * scores_stride + t];
+			const __m256 vw = _mm256_set1_ps(w);
+			float* o = out + h * out_stride;
+			size_t i = 0;
+			if (t == 0)
 			{
-				const __m256 acc = _mm256_loadu_ps(out + i);
-				const __m256 v = _mm256_loadu_ps(vrow + i);
-				_mm256_storeu_ps(out + i, _mm256_fmadd_ps(vw, v, acc));
+				for (; i + 8 <= head_dim; i += 8)
+					_mm256_storeu_ps(o + i,
+					                 _mm256_mul_ps(vw, _mm256_loadu_ps(vrow + i)));
+				for (; i < head_dim; ++i) o[i] = w * vrow[i];
 			}
-			for (; i < head_dim; ++i) out[i] += w * vrow[i];
+			else
+			{
+				for (; i + 8 <= head_dim; i += 8)
+				{
+					const __m256 acc = _mm256_loadu_ps(o + i);
+					const __m256 v = _mm256_loadu_ps(vrow + i);
+					_mm256_storeu_ps(o + i, _mm256_fmadd_ps(vw, v, acc));
+				}
+				for (; i < head_dim; ++i) o[i] += w * vrow[i];
+			}
 		}
 	}
 }
@@ -518,36 +510,6 @@ float nnc_dot_f32_simd(const float* a, const float* b, const size_t n)
 	return acc;
 }
 
-// ---- fused FP16 W * FP32 x -> FP32 y gemv ------------------------------
-
-void nnc_gemv_f16w_f32x(const void* W, const float* x, float* y,
-                        const uint32_t rows, const uint32_t cols)
-{
-	if (rows == 0 || cols == 0) return;
-
-	if ((cols & 7u) == 0)
-	{
-		const auto fn = global_cache().get_gemv_f16w_f32x(rows, cols);
-		fn(W, x, y);
-		return;
-	}
-
-	// Scalar fallback (cols not a multiple of 8). Uses the same software
-	// FP16 decode as the dot fallback for bit-identical behaviour with the
-	// hardware F16C path on normal inputs.
-	const auto Wh = static_cast<const uint16_t*>(W);
-	for (uint32_t r = 0; r < rows; ++r)
-	{
-		double s = 0.0;
-		const uint16_t* row = Wh + static_cast<size_t>(r) * cols;
-		for (uint32_t k = 0; k < cols; ++k)
-		{
-			s += static_cast<double>(fp16_to_fp32_scalar(row[k])) * x[k];
-		}
-		y[r] = static_cast<float>(s);
-	}
-}
-
 // ---- elementwise bias add ----------------------------------------------
 
 void nnc_add_inplace_f32(float* y, const float* b, const size_t n)
@@ -665,6 +627,10 @@ namespace
 	public:
 		using task_fn_t = void (*)(const int tid, const void* user);
 
+		// Bounds the fixed-size per-thread arrays used by dispatch() and by
+		// the argmax reduction below.
+		static constexpr int MAX_THREADS = 64;
+
 		static nnc_gemv_pool& global()
 		{
 			static nnc_gemv_pool p(decide_n_workers());
@@ -684,7 +650,7 @@ namespace
 			task_user_ = user;
 			// Snapshot per-worker baselines, advance ticket, run main
 			// share, spin-wait for workers.
-			unsigned baselines[64];
+			unsigned baselines[MAX_THREADS];
 			for (int i = 0; i < nw; ++i)
 				baselines[i] = workers_[i]->done.load(std::memory_order_acquire);
 			cur_ticket_.fetch_add(1, std::memory_order_release);
@@ -714,15 +680,22 @@ namespace
 		{
 			// Env override for perf experiments: NNC_THREADS = total
 			// threads (workers + main). Otherwise default cap at 8.
+			// Hard-capped at MAX_THREADS: dispatch() and the argmax
+			// reduction index fixed-size stack arrays by thread id.
+			int total = 8;
 			if (const char* e = std::getenv("NNC_THREADS"))
 			{
 				const int t = std::atoi(e);
-				if (t > 0) return (t > 1 ? t - 1 : 0);
+				if (t > 0) total = t;
 			}
-			const unsigned hw = std::thread::hardware_concurrency();
-			const unsigned t = (hw > 0 ? hw : 1);
-			const unsigned use = (t > 8) ? 8u : t;
-			return (use > 1 ? static_cast<int>(use) - 1 : 0);
+			else
+			{
+				const unsigned hw = std::thread::hardware_concurrency();
+				total = static_cast<int>(hw > 0 ? hw : 1u);
+				if (total > 8) total = 8;
+			}
+			if (total > MAX_THREADS) total = MAX_THREADS;
+			return total > 1 ? total - 1 : 0;
 		}
 
 		explicit nnc_gemv_pool(const int n)
@@ -885,7 +858,7 @@ int nnc_gemv_bf16w_argmax_f32x(const void* W, const float* x,
 				float bv;
 				int bi;
 			};
-			alignas(64) local locals[64]{};
+			alignas(64) local locals[nnc_gemv_pool::MAX_THREADS]{};
 			for (int i = 0; i < n_threads; ++i)
 			{
 				locals[i].bv = -std::numeric_limits<float>::infinity();
@@ -1017,39 +990,113 @@ int nnc_gemv_bf16w_argmax_f32x(const void* W, const float* x,
 // layout (qs first, scales second) so the JIT kernel can use cheap
 // scaled-q + FMA without an interleaved per-block fp16 unpack.
 
-void nnc_quantize_bf16_to_q8_0(const uint16_t* W_bf16, int8_t* qs, float* scales,
+void nnc_quantize_bf16_to_q8_0(const uint16_t* W_bf16, int8_t* qs, uint16_t* scales,
                                const size_t rows, const size_t cols)
 {
 	NNC_ASSERT(W_bf16 && qs && scales);
 	NNC_ASSERT(cols > 0 && (cols % 32) == 0);
 
-	const size_t nblocks = cols / 32;
-	for (size_t r = 0; r < rows; ++r)
+	float vals[32];
+	const size_t n = rows * cols;
+	for (size_t b = 0; b < n; b += 32)
 	{
-		const uint16_t* row_w = W_bf16 + r * cols;
-		int8_t* row_q = qs + r * cols;
-		float* row_s = scales + r * nblocks;
-		for (size_t b = 0; b < nblocks; ++b)
+		for (size_t k = 0; k < 32; ++k) vals[k] = nnc_bf16_to_f32(W_bf16[b + k]);
+		nnc_quantize_f32_to_q8_0(vals, qs + b, scales + b / 32, 32);
+	}
+}
+
+void nnc_quantize_f32_to_q8_0(const float* src, int8_t* qs, uint16_t* scales,
+                              const size_t n)
+{
+	NNC_ASSERT(src && qs && scales);
+	NNC_ASSERT(n > 0 && (n % 32) == 0);
+
+	for (size_t b = 0; b < n; b += 32)
+	{
+		float amax = 0.0f;
+		for (size_t k = 0; k < 32; ++k)
 		{
-			float amax = 0.0f;
-			float vals[32];
-			for (size_t k = 0; k < 32; ++k)
-			{
-				vals[k] = nnc_bf16_to_f32(row_w[b * 32 + k]);
-				const float a = std::fabs(vals[k]);
-				if (a > amax) amax = a;
-			}
-			const float scale = amax / 127.0f;
-			row_s[b] = scale;
-			const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-			for (size_t k = 0; k < 32; ++k)
-			{
-				int q = static_cast<int>(std::lrintf(vals[k] * inv));
-				if (q > 127) q = 127;
-				if (q < -127) q = -127;
-				row_q[b * 32 + k] = static_cast<int8_t>(q);
-			}
+			const float a = std::fabs(src[b + k]);
+			if (a > amax) amax = a;
 		}
+		// Round-trip the scale through BF16 first so the encoder quantizes
+		// against exactly the value the kernel will multiply by.
+		const float scale = nnc_bf16_to_f32(nnc_f32_to_bf16(amax / 127.0f));
+		scales[b / 32] = nnc_f32_to_bf16(scale);
+		const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+		for (size_t k = 0; k < 32; ++k)
+		{
+			int q = static_cast<int>(std::lrintf(src[b + k] * inv));
+			if (q > 127) q = 127;
+			if (q < -127) q = -127;
+			qs[b + k] = static_cast<int8_t>(q);
+		}
+	}
+}
+
+void nnc_quantize_f32_to_q4_s(const float* src, uint8_t* qs,
+                              uint16_t* scales, uint16_t* biases, const size_t n)
+{
+	NNC_ASSERT(src && qs && scales && biases);
+	NNC_ASSERT(n > 0 && (n % 32) == 0);
+
+	for (size_t b = 0; b < n; b += 32)
+	{
+		float lo = src[b], hi = src[b];
+		for (size_t k = 1; k < 32; ++k)
+		{
+			const float v = src[b + k];
+			if (v < lo) lo = v;
+			if (v > hi) hi = v;
+		}
+		// Round-trip scale and bias through BF16 before quantizing the
+		// values, so the encoder sees exactly what the kernel will use.
+		const float scale = nnc_bf16_to_f32(nnc_f32_to_bf16((hi - lo) / 15.0f));
+		const float bias = nnc_bf16_to_f32(nnc_f32_to_bf16(lo));
+		scales[b / 32] = nnc_f32_to_bf16(scale);
+		biases[b / 32] = nnc_f32_to_bf16(bias);
+		const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+		// byte i packs element i (low nibble) and element i+16 (high).
+		uint8_t* blk = qs + b / 2;
+		for (size_t k = 0; k < 16; ++k)
+		{
+			int q0 = static_cast<int>(std::lrintf((src[b + k] - bias) * inv));
+			int q1 = static_cast<int>(std::lrintf((src[b + k + 16] - bias) * inv));
+			if (q0 < 0) q0 = 0;
+			if (q0 > 15) q0 = 15;
+			if (q1 < 0) q1 = 0;
+			if (q1 > 15) q1 = 15;
+			blk[k] = static_cast<uint8_t>(q0 | (q1 << 4));
+		}
+	}
+}
+
+float nnc_dot_bf16_f32_simd(const uint16_t* a, const float* b, const size_t n)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8)
+	{
+		const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+		const __m256i wide = _mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16);
+		acc = _mm256_fmadd_ps(_mm256_castsi256_ps(wide), _mm256_loadu_ps(b + i), acc);
+	}
+	float s = hsum_ymm(acc);
+	for (; i < n; ++i) s += nnc_bf16_to_f32(a[i]) * b[i];
+	return s;
+}
+
+void nnc_block_sums_f32(const float* x, float* out, const size_t n)
+{
+	NNC_ASSERT(n > 0 && (n % 32) == 0);
+	for (size_t b = 0; b < n; b += 32)
+	{
+		__m256 acc = _mm256_loadu_ps(x + b);
+		acc = _mm256_add_ps(acc, _mm256_loadu_ps(x + b + 8));
+		acc = _mm256_add_ps(acc, _mm256_loadu_ps(x + b + 16));
+		acc = _mm256_add_ps(acc, _mm256_loadu_ps(x + b + 24));
+		out[b / 32] = hsum_ymm(acc);
 	}
 }
 
@@ -1058,7 +1105,7 @@ namespace
 	struct q8_gemv_ctx
 	{
 		const int8_t* qs;
-		const float* scales;
+		const uint16_t* scales;
 		const float* x;
 		float* y;
 		uint32_t cols;
@@ -1079,7 +1126,7 @@ namespace
 		const size_t qs_stride = c->cols;
 		const size_t scales_stride = c->cols / 32;
 		const int8_t* qs_tid = c->qs + r0 * qs_stride;
-		const float* scales_tid = c->scales + r0 * scales_stride;
+		const uint16_t* scales_tid = c->scales + r0 * scales_stride;
 		float* y_tid = c->y + r0;
 		for (uint32_t r = r0; r < r1; ++r)
 		{
@@ -1091,7 +1138,7 @@ namespace
 	}
 }
 
-void nnc_gemv_q8_0_f32x(const int8_t* qs, const float* scales,
+void nnc_gemv_q8_0_f32x(const int8_t* qs, const uint16_t* scales,
                         const float* x, float* y,
                         const uint32_t rows, const uint32_t cols)
 {
@@ -1117,24 +1164,315 @@ void nnc_gemv_q8_0_f32x(const int8_t* qs, const float* scales,
 	}
 }
 
+// ---- Q4 (nnc split 4-bit) gemv ----------------------------------------
+//
+// The JIT kernel handles sum_b scale_b * sum q*x. The bias term factors
+// into biases[r] . xsum, a plain f32 dot over cols/32 elements that the
+// worker does inline right after each row's kernel call.
+
+namespace
+{
+	struct q4_gemv_ctx
+	{
+		const uint8_t* qs;
+		const uint16_t* scales;
+		const uint16_t* biases;
+		const float* x;
+		const float* xsum;
+		float* y;
+		uint32_t cols;
+		uint32_t rows;
+		int n_threads;
+		nnc_gemv_q4_s_1row_fn fn1;
+	};
+
+	void q4_gemv_worker(const int tid, const void* u)
+	{
+		const auto* c = static_cast<const q4_gemv_ctx*>(u);
+		const uint32_t per = c->rows / static_cast<uint32_t>(c->n_threads);
+		const uint32_t rem = c->rows % static_cast<uint32_t>(c->n_threads);
+		const uint32_t r0 = static_cast<uint32_t>(tid) * per
+			+ std::min(static_cast<uint32_t>(tid), rem);
+		const uint32_t r1 = r0 + per + (static_cast<uint32_t>(tid) < rem ? 1u : 0u);
+		if (r0 == r1) return;
+		const size_t nblocks = c->cols / 32;
+		const size_t qs_stride = c->cols / 2;
+		const uint8_t* qs_tid = c->qs + r0 * qs_stride;
+		const uint16_t* sc_tid = c->scales + r0 * nblocks;
+		const uint16_t* bi_tid = c->biases + r0 * nblocks;
+		float* y_tid = c->y + r0;
+		for (uint32_t r = r0; r < r1; ++r)
+		{
+			c->fn1(qs_tid, c->x, y_tid, sc_tid);
+			*y_tid += nnc_dot_bf16_f32_simd(bi_tid, c->xsum, nblocks);
+			qs_tid += qs_stride;
+			sc_tid += nblocks;
+			bi_tid += nblocks;
+			y_tid += 1;
+		}
+	}
+}
+
+void nnc_gemv_q4_s_f32x(const uint8_t* qs, const uint16_t* scales,
+                        const uint16_t* biases, const float* x,
+                        const float* xsum, float* y,
+                        const uint32_t rows, const uint32_t cols)
+{
+	if (rows == 0 || cols == 0) return;
+	NNC_ASSERT((cols % 32) == 0);
+
+	const auto fn1 = global_cache().get_gemv_q4_s_1row(cols);
+
+	auto& pool = nnc_gemv_pool::global();
+	const int n_threads = pool.n_threads();
+	if (n_threads > 1 && rows >= 256 && cols >= 256)
+	{
+		q4_gemv_ctx ctx{qs, scales, biases, x, xsum, y, cols, rows, n_threads, fn1};
+		pool.dispatch(&q4_gemv_worker, &ctx);
+		return;
+	}
+
+	const size_t nblocks = cols / 32;
+	const size_t qs_stride = cols / 2;
+	for (uint32_t r = 0; r < rows; ++r)
+	{
+		fn1(qs + r * qs_stride, x, y + r, scales + r * nblocks);
+		y[r] += nnc_dot_bf16_f32_simd(biases + r * nblocks, xsum, nblocks);
+	}
+}
+
+// ---- batched gemv (prefill) -------------------------------------------
+//
+// One pass over the weights serves the whole batch: the outer loop walks
+// rows (so a row is fetched from DRAM once) and the inner loop walks the
+// batch (hitting that row in L1). Threading splits the row axis exactly
+// as the single-vector paths do.
+
+namespace
+{
+	struct batch_ctx
+	{
+		const void* w; // BF16 W / Q8_0 qs / Q4 qs
+		const void* scales; // f32 (Q8_0) or bf16 (Q4)
+		const uint16_t* biases; // Q4 only
+		const float* X;
+		const float* XSUM; // Q4 only
+		float* Y;
+		size_t x_stride;
+		size_t xsum_stride;
+		size_t y_stride;
+		uint32_t cols;
+		uint32_t rows;
+		uint32_t n_batch;
+		int n_threads;
+		const void* fn;
+	};
+
+	// Row range [r0, r1) for this worker, or an empty range.
+	void batch_rows(const batch_ctx* c, const int tid, uint32_t& r0, uint32_t& r1)
+	{
+		const uint32_t per = c->rows / static_cast<uint32_t>(c->n_threads);
+		const uint32_t rem = c->rows % static_cast<uint32_t>(c->n_threads);
+		r0 = static_cast<uint32_t>(tid) * per + std::min(static_cast<uint32_t>(tid), rem);
+		r1 = r0 + per + (static_cast<uint32_t>(tid) < rem ? 1u : 0u);
+	}
+
+	void bf16_batch_worker(const int tid, const void* u)
+	{
+		const auto* c = static_cast<const batch_ctx*>(u);
+		uint32_t q0, q1;
+		batch_rows(c, tid, q0, q1);
+		if (q0 == q1) return;
+		const auto fn4 = reinterpret_cast<nnc_gemv_bf16w_f32x_fn>(const_cast<void*>(c->fn));
+		const size_t group_stride = static_cast<size_t>(c->cols) * 2 * 4;
+		const auto* W = static_cast<const uint8_t*>(c->w) + q0 * group_stride;
+		for (uint32_t q = q0; q < q1; ++q)
+		{
+			for (uint32_t n = 0; n < c->n_batch; ++n)
+				fn4(W, c->X + n * c->x_stride, c->Y + n * c->y_stride + q * 4);
+			W += group_stride;
+		}
+	}
+
+	void q8_batch_worker(const int tid, const void* u)
+	{
+		const auto* c = static_cast<const batch_ctx*>(u);
+		uint32_t r0, r1;
+		batch_rows(c, tid, r0, r1);
+		if (r0 == r1) return;
+		const auto fn1 = reinterpret_cast<nnc_gemv_q8_0_1row_fn>(const_cast<void*>(c->fn));
+		const size_t nblocks = c->cols / 32;
+		const auto* qs = static_cast<const int8_t*>(c->w) + static_cast<size_t>(r0) * c->cols;
+		const uint16_t* sc = static_cast<const uint16_t*>(c->scales) + r0 * nblocks;
+		for (uint32_t r = r0; r < r1; ++r)
+		{
+			for (uint32_t n = 0; n < c->n_batch; ++n)
+				fn1(qs, c->X + n * c->x_stride, c->Y + n * c->y_stride + r, sc);
+			qs += c->cols;
+			sc += nblocks;
+		}
+	}
+
+	void q4_batch_worker(const int tid, const void* u)
+	{
+		const auto* c = static_cast<const batch_ctx*>(u);
+		uint32_t r0, r1;
+		batch_rows(c, tid, r0, r1);
+		if (r0 == r1) return;
+		const auto fn1 = reinterpret_cast<nnc_gemv_q4_s_1row_fn>(const_cast<void*>(c->fn));
+		const size_t nblocks = c->cols / 32;
+		const size_t qs_stride = c->cols / 2;
+		const auto* qs = static_cast<const uint8_t*>(c->w) + r0 * qs_stride;
+		const uint16_t* sc = static_cast<const uint16_t*>(c->scales) + r0 * nblocks;
+		const uint16_t* bi = c->biases + r0 * nblocks;
+		for (uint32_t r = r0; r < r1; ++r)
+		{
+			for (uint32_t n = 0; n < c->n_batch; ++n)
+			{
+				float* yp = c->Y + n * c->y_stride + r;
+				fn1(qs, c->X + n * c->x_stride, yp, sc);
+				*yp += nnc_dot_bf16_f32_simd(bi, c->XSUM + n * c->xsum_stride, nblocks);
+			}
+			qs += qs_stride;
+			sc += nblocks;
+			bi += nblocks;
+		}
+	}
+
+	// Shared dispatch: run `fn` over the row axis, threaded when the shape
+	// is big enough to pay for it.
+	void run_batch(batch_ctx& ctx, const nnc_gemv_pool::task_fn_t fn,
+	               const uint32_t work_rows)
+	{
+		auto& pool = nnc_gemv_pool::global();
+		ctx.n_threads = pool.n_threads();
+		ctx.rows = work_rows;
+		if (ctx.n_threads > 1 && work_rows >= 64 && ctx.cols >= 256)
+		{
+			pool.dispatch(fn, &ctx);
+			return;
+		}
+		ctx.n_threads = 1;
+		fn(0, &ctx);
+	}
+}
+
+void nnc_gemv_bf16w_f32x_batch(const void* W, const float* X, const size_t x_stride,
+                               float* Y, const size_t y_stride,
+                               const uint32_t rows, const uint32_t cols,
+                               const uint32_t n_batch)
+{
+	if (rows == 0 || cols == 0 || n_batch == 0) return;
+	if (n_batch == 1)
+	{
+		nnc_gemv_bf16w_f32x(W, X, Y, rows, cols);
+		return;
+	}
+	// The 4-row kernel is the batched path's unit of work; anything it
+	// can't express falls back to repeating the single-vector gemv.
+	if ((rows & 3u) != 0 || (cols & 7u) != 0)
+	{
+		for (uint32_t n = 0; n < n_batch; ++n)
+			nnc_gemv_bf16w_f32x(W, X + n * x_stride, Y + n * y_stride, rows, cols);
+		return;
+	}
+
+	batch_ctx ctx{};
+	ctx.w = W;
+	ctx.X = X;
+	ctx.Y = Y;
+	ctx.x_stride = x_stride;
+	ctx.y_stride = y_stride;
+	ctx.cols = cols;
+	ctx.n_batch = n_batch;
+	ctx.fn = reinterpret_cast<const void*>(global_cache().get_gemv_bf16w_f32x(4, cols));
+	run_batch(ctx, &bf16_batch_worker, rows / 4);
+}
+
+void nnc_gemv_q8_0_f32x_batch(const int8_t* qs, const uint16_t* scales,
+                              const float* X, const size_t x_stride,
+                              float* Y, const size_t y_stride,
+                              const uint32_t rows, const uint32_t cols,
+                              const uint32_t n_batch)
+{
+	if (rows == 0 || cols == 0 || n_batch == 0) return;
+	if (n_batch == 1)
+	{
+		nnc_gemv_q8_0_f32x(qs, scales, X, Y, rows, cols);
+		return;
+	}
+	NNC_ASSERT((cols % 32) == 0);
+
+	batch_ctx ctx{};
+	ctx.w = qs;
+	ctx.scales = scales;
+	ctx.X = X;
+	ctx.Y = Y;
+	ctx.x_stride = x_stride;
+	ctx.y_stride = y_stride;
+	ctx.cols = cols;
+	ctx.n_batch = n_batch;
+	ctx.fn = reinterpret_cast<const void*>(global_cache().get_gemv_q8_0_1row(cols));
+	run_batch(ctx, &q8_batch_worker, rows);
+}
+
+void nnc_gemv_q4_s_f32x_batch(const uint8_t* qs, const uint16_t* scales,
+                              const uint16_t* biases,
+                              const float* X, const size_t x_stride,
+                              const float* XSUM, const size_t xsum_stride,
+                              float* Y, const size_t y_stride,
+                              const uint32_t rows, const uint32_t cols,
+                              const uint32_t n_batch)
+{
+	if (rows == 0 || cols == 0 || n_batch == 0) return;
+	if (n_batch == 1)
+	{
+		nnc_gemv_q4_s_f32x(qs, scales, biases, X, XSUM, Y, rows, cols);
+		return;
+	}
+	NNC_ASSERT((cols % 32) == 0);
+
+	batch_ctx ctx{};
+	ctx.w = qs;
+	ctx.scales = scales;
+	ctx.biases = biases;
+	ctx.X = X;
+	ctx.XSUM = XSUM;
+	ctx.Y = Y;
+	ctx.x_stride = x_stride;
+	ctx.xsum_stride = xsum_stride;
+	ctx.y_stride = y_stride;
+	ctx.cols = cols;
+	ctx.n_batch = n_batch;
+	ctx.fn = reinterpret_cast<const void*>(global_cache().get_gemv_q4_s_1row(cols));
+	run_batch(ctx, &q4_batch_worker, rows);
+}
+
 // ---- SwiGLU ------------------------------------------------------------
 //
 // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 // y[i] = silu(gate[i]) * up[i]
 //
-// Uses the existing exp_ps approximation if available; otherwise the
-// std::exp scalar path. AVX2 inner uses 1 / (1 + exp(-g)) per lane via
-// rcp_ps or a Cephes-style poly. Keep it simple: scalar std::exp inside
-// an 8-wide gather/scatter wrapper. This is not in the model's hottest
-// inner loop so accuracy beats throughput here.
+// Reuses the AVX2 exp approximation from the softmax path; the reciprocal
+// is a true divide (not rcp_ps) to keep ~1 ulp accuracy.
 
 void nnc_swiglu_f32(float* y, const float* gate, const float* up, const size_t n)
 {
-	for (size_t i = 0; i < n; ++i)
+	const __m256 one = _mm256_set1_ps(1.0f);
+	size_t i = 0;
+	const size_t np = n & ~size_t{7};
+	for (; i < np; i += 8)
+	{
+		const __m256 g = _mm256_loadu_ps(gate + i);
+		const __m256 e = nnc_exp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g));
+		const __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+		const __m256 r = _mm256_mul_ps(_mm256_mul_ps(g, sig), _mm256_loadu_ps(up + i));
+		_mm256_storeu_ps(y + i, r);
+	}
+	for (; i < n; ++i)
 	{
 		const float g = gate[i];
-		const float sig = 1.0f / (1.0f + std::exp(-g));
-		y[i] = g * sig * up[i];
+		y[i] = g / (1.0f + std::exp(-g)) * up[i];
 	}
 }
 
@@ -1146,26 +1484,33 @@ void nnc_rope_f32(float* x, const uint32_t n_heads, const uint32_t head_dim,
 	if (n_rot == 0) return;
 	NNC_ASSERT((n_rot & 1u) == 0 && "nnc_rope_f32: n_rot must be even");
 	const uint32_t half = n_rot / 2;
-	const float p = pos;
-	// freq_base ^ (-2/n_rot) is the per-step ratio of the geometric inv
-	// schedule. Compute once, then accumulate; avoids one std::pow per
-	// (head, pair) on the hot path (~16x faster than the per-element
-	// std::pow it replaces for n_rot=256).
-	const float ratio = std::pow(freq_base, -2.0f / static_cast<float>(n_rot));
-	for (uint32_t h = 0; h < n_heads; ++h)
+	// theta_i depends only on the lane index, not the head, so the
+	// cos/sin pair is shared by all n_heads. freq_base^(-2/n_rot) is the
+	// per-step ratio of the geometric inv schedule: compute once, then
+	// accumulate (avoids one std::pow per pair).
+	constexpr uint32_t MAX_HALF = 256; // head_dim <= 512 for every model we load
+	NNC_ASSERT(half <= MAX_HALF && "nnc_rope_f32: n_rot/2 exceeds table size");
+	float cs[MAX_HALF], sn[MAX_HALF];
 	{
-		float* xh = x + static_cast<size_t>(h) * head_dim;
+		const float ratio = std::pow(freq_base, -2.0f / static_cast<float>(n_rot));
 		float inv = 1.0f;
 		for (uint32_t i = 0; i < half; ++i)
 		{
-			const float theta = p * inv;
-			const float c = std::cos(theta);
-			const float s = std::sin(theta);
+			const float theta = pos * inv;
+			cs[i] = std::cos(theta);
+			sn[i] = std::sin(theta);
+			inv *= ratio;
+		}
+	}
+	for (uint32_t h = 0; h < n_heads; ++h)
+	{
+		float* xh = x + static_cast<size_t>(h) * head_dim;
+		for (uint32_t i = 0; i < half; ++i)
+		{
 			const float a = xh[i];
 			const float b = xh[i + half];
-			xh[i] = c * a - s * b;
-			xh[i + half] = s * a + c * b;
-			inv *= ratio;
+			xh[i] = cs[i] * a - sn[i] * b;
+			xh[i + half] = sn[i] * a + cs[i] * b;
 		}
 	}
 }
@@ -1199,7 +1544,51 @@ void nnc_embed_row_bf16(float* y, const void* table, const int token_id,
 	}
 }
 
-// ---- K-quant dequantizers ---------------------------------------------
+void nnc_embed_row_q8_0(float* y, const int8_t* qs, const uint16_t* scales,
+                        const int token_id, const size_t n_embd, const float scale)
+{
+	NNC_ASSERT((n_embd % 32) == 0);
+	const size_t nblocks = n_embd / 32;
+	const int8_t* row = qs + static_cast<size_t>(token_id) * n_embd;
+	const uint16_t* rs = scales + static_cast<size_t>(token_id) * nblocks;
+
+	for (size_t b = 0; b < nblocks; ++b)
+	{
+		const __m256 vs = _mm256_set1_ps(nnc_bf16_to_f32(rs[b]) * scale);
+		const int8_t* p = row + b * 32;
+		for (size_t j = 0; j < 32; j += 8)
+		{
+			const __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + j));
+			const __m256 f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
+			_mm256_storeu_ps(y + b * 32 + j, _mm256_mul_ps(f, vs));
+		}
+	}
+}
+
+void nnc_embed_row_q4_s(float* y, const uint8_t* qs, const uint16_t* scales,
+                        const uint16_t* biases, const int token_id,
+                        const size_t n_embd, const float scale)
+{
+	NNC_ASSERT((n_embd % 32) == 0);
+	const size_t nblocks = n_embd / 32;
+	const uint8_t* row = qs + static_cast<size_t>(token_id) * (n_embd / 2);
+	const uint16_t* rs = scales + static_cast<size_t>(token_id) * nblocks;
+	const uint16_t* rb = biases + static_cast<size_t>(token_id) * nblocks;
+
+	for (size_t b = 0; b < nblocks; ++b)
+	{
+		const float s = nnc_bf16_to_f32(rs[b]) * scale;
+		const float bias = nnc_bf16_to_f32(rb[b]) * scale;
+		const uint8_t* blk = row + b * 16;
+		float* out = y + b * 32;
+		for (size_t k = 0; k < 16; ++k)
+		{
+			out[k] = s * static_cast<float>(blk[k] & 0x0F) + bias;
+			out[k + 16] = s * static_cast<float>(blk[k] >> 4) + bias;
+		}
+	}
+}
+
 //
 // Layouts mirror ggml's `block_q*_K` structs (little-endian, x86-only).
 // Block size is 256 elements = 8 sub-blocks of 32 (Q4_K/Q5_K) or 16
@@ -1255,6 +1644,25 @@ namespace
 		}
 	}
 } // namespace
+
+void nnc_dequantize_q8_0_to_f32(const void* blocks, float* dst,
+                                const size_t n_elements)
+{
+	NNC_ASSERT(blocks && dst);
+	NNC_ASSERT(n_elements > 0 && (n_elements % 32) == 0);
+
+	// block_q8_0 = { fp16 d; int8 qs[32] }, 34 bytes, no padding.
+	const auto* p = static_cast<const uint8_t*>(blocks);
+	const size_t nb = n_elements / 32;
+	for (size_t i = 0; i < nb; ++i, p += 34)
+	{
+		uint16_t dh;
+		std::memcpy(&dh, p, 2);
+		const float d = fp16_to_fp32_scalar(dh);
+		const auto* qs = reinterpret_cast<const int8_t*>(p + 2);
+		for (int k = 0; k < 32; ++k) dst[i * 32 + k] = d * qs[k];
+	}
+}
 
 void nnc_dequantize_q4_k_to_f32(const void* blocks, float* dst,
                                 const size_t n_elements)
@@ -1379,11 +1787,13 @@ void nnc_dequantize_q6_k_to_f32(const void* blocks, float* dst,
 	}
 }
 
-bool nnc_dequantize_kquant_to_f32(const uint32_t ggml_type, const void* blocks,
-                                  float* dst, const size_t n_elements)
+bool nnc_dequantize_to_f32(const uint32_t ggml_type, const void* blocks,
+                           float* dst, const size_t n_elements)
 {
 	switch (ggml_type)
 	{
+		case 8: nnc_dequantize_q8_0_to_f32(blocks, dst, n_elements);
+			return true;
 		case 12: nnc_dequantize_q4_k_to_f32(blocks, dst, n_elements);
 			return true;
 		case 13: nnc_dequantize_q5_k_to_f32(blocks, dst, n_elements);
@@ -1394,126 +1804,14 @@ bool nnc_dequantize_kquant_to_f32(const uint32_t ggml_type, const void* blocks,
 	}
 }
 
-// ---- graph-level fusion: mul_mat -> repeat(bias) -> add ----------------
-
-#include <unordered_map>
-
-namespace
+uint32_t nnc_quant_block_elems(const uint32_t ggml_type)
 {
-	std::unordered_map<const nnc_tensor*, const float*> g_fused_bias;
-	std::unordered_map<const nnc_tensor*, void*> g_dst_override;
-	std::unordered_map<const nnc_tensor*, bool> g_fused_gelu;
-
-	bool is_1d_bias_for(const nnc_tensor* bias, const nnc_tensor* mm)
+	switch (ggml_type)
 	{
-		// 1D FP32 vector whose length matches the row count of the mul_mat
-		// output (mm->ne[0]). The repeat broadcasts it to the full output.
-		return bias && bias->n_dims == 1
-			&& bias->type == NNC_TYPE_F32
-			&& bias->ne[0] == mm->ne[0];
+		case 8: return 32; // Q8_0
+		case 12: // Q4_K
+		case 13: // Q5_K
+		case 14: return 256; // Q6_K
+		default: return 0;
 	}
-}
-
-void nnc_graph_prefuse(const nnc_cgraph* g)
-{
-	g_fused_bias.clear();
-	g_dst_override.clear();
-	g_fused_gelu.clear();
-	if (!g) return;
-
-	const int n = g->n_nodes;
-
-	// Count how many nodes consume each tensor as a src. We only fuse if
-	// the intermediate `repeat` and `add` outputs are referenced exactly
-	// once — by the next node in the chain. Without this check, a future
-	// graph that branches off the bias-added activation would silently
-	// lose data when we set those nodes' op to NNC_OP_NONE.
-	std::unordered_map<const nnc_tensor*, int> use_count;
-	for (int j = 0; j < n; ++j)
-	{
-		const nnc_tensor* nd = g->nodes[j];
-		if (nd->src0) ++use_count[nd->src0];
-		if (nd->src1) ++use_count[nd->src1];
-	}
-
-	for (int i = 0; i + 2 < n; ++i)
-	{
-		const nnc_tensor* mm = g->nodes[i];
-		nnc_tensor* rp = g->nodes[i + 1];
-		nnc_tensor* ad = g->nodes[i + 2];
-
-		if (mm->op != NNC_OP_MUL_MAT) continue;
-		if (rp->op != NNC_OP_REPEAT) continue;
-		if (ad->op != NNC_OP_ADD) continue;
-
-		// repeat(bias) -> shape of mm
-		if (rp->src1 != mm) continue; // repeat target shape must be mm
-		if (!is_1d_bias_for(rp->src0, mm)) continue;
-
-		// add(repeat, mm) or add(mm, repeat)
-		const bool a = (ad->src0 == rp && ad->src1 == mm);
-		const bool b = (ad->src0 == mm && ad->src1 == rp);
-		if (!a && !b) continue;
-
-		// Only fuse the FP16-weights / FP32-activations fast path that our
-		// mul_mat shim already handles inline.
-		if (!(mm->src0->type == NNC_TYPE_F16
-			&& mm->src1->type == NNC_TYPE_F32))
-			continue;
-
-		// Refuse to fuse if `mm`, `rp`, or `ad` feed any other consumer.
-		// `mm` is consumed by `rp`+`ad` (count 2), `rp` by `ad` (count 1).
-		// Anything higher means the intermediate result is read elsewhere
-		// and we can't safely zero out the producing op.
-		auto count = [&](const nnc_tensor* t)
-		{
-			const auto it = use_count.find(t);
-			return it == use_count.end() ? 0 : it->second;
-		};
-		if (count(mm) != 2 || count(rp) != 1) continue;
-
-		g_fused_bias[mm] = static_cast<const float*>(rp->src0->data);
-		g_dst_override[mm] = ad->data;
-		rp->op = NNC_OP_NONE;
-		ad->op = NNC_OP_NONE;
-
-		if (i + 3 < n)
-		{
-			nnc_tensor* gl = g->nodes[i + 3];
-			if (gl->op == NNC_OP_GELU
-				&& gl->src0 == ad
-				&& gl->type == NNC_TYPE_F32
-				&& gl->ne[0] == ad->ne[0]
-				&& count(ad) == 1)
-			{
-				g_dst_override[mm] = gl->data;
-				g_fused_gelu[mm] = true;
-				gl->op = NNC_OP_NONE;
-			}
-		}
-	}
-}
-
-const float* nnc_fused_bias_for(const nnc_tensor* mm)
-{
-	const auto it = g_fused_bias.find(mm);
-	return it == g_fused_bias.end() ? nullptr : it->second;
-}
-
-bool nnc_should_skip(const nnc_tensor* /*node*/)
-{
-	// Skipping is now done by mutating node->op to NNC_OP_NONE in prefuse;
-	// keep this entry point for header compatibility / future use.
-	return false;
-}
-
-void* nnc_fused_dst_for(const nnc_tensor* mm)
-{
-	const auto it = g_dst_override.find(mm);
-	return it == g_dst_override.end() ? nullptr : it->second;
-}
-
-bool nnc_fused_gelu_for(const nnc_tensor* mm)
-{
-	return g_fused_gelu.contains(mm);
 }

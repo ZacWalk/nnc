@@ -26,26 +26,24 @@ using nnc_dot_f32_fn = float (*)(const float* a, const float* b, size_t n);
 // the kernel — there are NO size args at runtime.
 using nnc_gemv_f32_fn = void (*)(const float* W, const float* x, float* y);
 
-// Specialized FP16 dot product:  return sum_i x[i] * y[i]  (i in [0, n)).
-// n is baked into the kernel; n must be > 0 and a multiple of 32.
-using nnc_dot_f16_fn = float (*)(const void* x, const void* y);
-
-// Specialized fused gemv:
-//   y[r] = sum_k fp16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
-// W is FP16, x and y are FP32. rows and cols are baked.
-using nnc_gemv_f16w_f32x_fn = void (*)(const void* W, const float* x, float* y);
-
 // Specialized fused gemv:
 //   y[r] = sum_k bf16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
 // W is BF16, x and y are FP32. rows and cols are baked.
 using nnc_gemv_bf16w_f32x_fn = void (*)(const void* W, const float* x, float* y);
 
 // Specialized single-row Q8_0 dot:
-//   *y_out = sum_b scales[b] * sum_{k in block b} qs[k] * x[k]
-// qs and x are length cols (cols % 32 == 0); scales is length cols/32.
-// cols is baked. Caller iterates over rows externally.
+//   *y_out = sum_b bf16(scales[b]) * sum_{k in block b} qs[k] * x[k]
+// qs and x are length cols (cols % 32 == 0); scales is cols/32 BF16
+// values. cols is baked. Caller iterates over rows externally.
 using nnc_gemv_q8_0_1row_fn = void (*)(const void* qs, const float* x,
-                                       float* y_out, const float* scales);
+                                       float* y_out, const uint16_t* scales);
+
+// Specialized single-row Q4 (nnc split 4-bit) dot:
+//   *y_out = sum_b bf16(scales[b]) * sum_{k in block b} nibble(qs)[k] * x[k]
+// qs is cols/2 bytes; scales is cols/32 BF16 values. The per-block bias
+// term is added by the caller. cols is baked.
+using nnc_gemv_q4_s_1row_fn = void (*)(const void* qs, const float* x,
+                                       float* y_out, const uint16_t* scales);
 
 // ---- Kernel cache ------------------------------------------------------
 
@@ -63,14 +61,6 @@ public:
 	// and reused thereafter. Returned pointer outlives the cache.
 	nnc_gemv_f32_fn get_gemv_f32(uint32_t rows, uint32_t cols);
 
-	// Returns a JITted FP16 dot kernel for the given n. n must be > 0 and
-	// a multiple of 32.
-	nnc_dot_f16_fn get_dot_f16(uint32_t n);
-
-	// Returns a JITted fused FP16 W * FP32 x -> FP32 y gemv kernel for the
-	// given (rows, cols). cols must be a positive multiple of 8.
-	nnc_gemv_f16w_f32x_fn get_gemv_f16w_f32x(uint32_t rows, uint32_t cols);
-
 	// Returns a JITted fused BF16 W * FP32 x -> FP32 y gemv kernel for the
 	// given (rows, cols). cols must be a positive multiple of 8.
 	nnc_gemv_bf16w_f32x_fn get_gemv_bf16w_f32x(uint32_t rows, uint32_t cols);
@@ -78,6 +68,10 @@ public:
 	// Returns a JITted single-row Q8_0 dot kernel for the given cols.
 	// cols must be a positive multiple of 32.
 	nnc_gemv_q8_0_1row_fn get_gemv_q8_0_1row(uint32_t cols);
+
+	// Returns a JITted single-row Q4 dot kernel for the given cols.
+	// cols must be a positive multiple of 32.
+	nnc_gemv_q4_s_1row_fn get_gemv_q4_s_1row(uint32_t cols);
 
 	// For tests / introspection.
 	size_t size() const;

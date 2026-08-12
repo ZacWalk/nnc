@@ -12,14 +12,6 @@
 // FP32 in / FP32 out. y and x may alias (out-of-place use is also fine).
 void nnc_gelu_f32(float* y, const float* x, size_t n);
 
-// Returns sum_i  fp16_to_fp32(x[i]) * fp16_to_fp32(y[i])  for i in [0, n).
-// x and y are arrays of IEEE 754 binary16 (nnc_fp16_t / uint16_t) values.
-// Routes through a JITted F16C+FMA kernel when n > 0 and n % 32 == 0; falls
-// back to a scalar reference for any other size. Thread-safety: the kernel
-// cache is guarded by an internal mutex on the build path; cached pointers
-// are read lock-free.
-float nnc_dot_f16_to_f32(const void* x, const void* y, size_t n);
-
 // In-place numerically-stable softmax over n contiguous floats:
 //   m = max(p);  p[i] = exp(p[i] - m) / sum_j exp(p[j] - m).
 // -INFINITY entries map to 0 (used for causal attention masks).
@@ -35,12 +27,30 @@ void nnc_softmax_f32_inplace(float* p, size_t n);
 //   nnc_softmax_f32_inplace(scores, n_t);
 //   memset(out, 0, head_dim * sizeof(float));
 //   for (t) for (i) out[i] += scores[t] * V[t*v_stride + i];
-// but in a single pass over `scores`: avoids the second read of the
-// softmax output (n_t * 4 bytes per head per layer per token) and the
-// initial zero of `out`. `V` is laid out as `n_t` rows of `v_stride`
-// floats with the head's V vector at offset 0 of each row.
+// but the accumulation writes `out` on the first V row instead of
+// zeroing it first, and keeps the weighted sum in one sweep. `V` is
+// laid out as `n_t` rows of `v_stride` floats with the head's V vector
+// at offset 0 of each row.
 void nnc_attn_softmax_v_f32(float* out, float* scores, const float* V,
                             size_t n_t, size_t v_stride, size_t head_dim);
+
+// Same, for `n_heads` query heads that all attend to the SAME K/V rows
+// (grouped-query attention with n_head > n_head_kv, which is the norm:
+// Gemma 3 1B is 4 query heads to 1 KV head).
+//
+// `scores` holds n_heads rows of n_t floats at `scores_stride` apart;
+// `out` holds n_heads vectors of head_dim floats at `out_stride` apart.
+//
+// The point is the loop order: `t` runs outermost so each V row is pulled
+// from memory once and then reused across all heads from L1. Calling the
+// single-head version in a loop instead re-streams the whole V cache once
+// per head, which at long context is pure wasted DRAM bandwidth.
+// Numerically identical to per-head calls — each head still accumulates
+// in increasing t order.
+void nnc_attn_softmax_v_multi_f32(float* out, size_t out_stride,
+                                  float* scores, size_t scores_stride,
+                                  const float* V, size_t n_t, size_t v_stride,
+                                  size_t head_dim, size_t n_heads);
 
 // LayerNorm over n contiguous floats (mean 0, variance 1, then optional
 // affine is applied by a separate op
@@ -68,17 +78,12 @@ void nnc_rmsnorm_gamma_multi_f32(float* y, const float* x,
 // dot_f32 kernel's call overhead would dominate.
 float nnc_dot_f32_simd(const float* a, const float* b, size_t n);
 
-// Fused FP16-weights, FP32-activations gemv:
-//   y[r] = sum_{k=0..cols-1} fp16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
-// W is FP16 (uint16_t / nnc_fp16_t), x and y are FP32. Routes to a JITted
-// AVX2+F16C+FMA kernel cached by (rows, cols) when cols is a multiple of 8.
-void nnc_gemv_f16w_f32x(const void* W, const float* x, float* y,
-                        uint32_t rows, uint32_t cols);
-
-// Same shape contract as nnc_gemv_f16w_f32x but W is BF16 (uint16_t with
-// the upper 16 bits of an IEEE-754 binary32). AVX2 path uses
-// vpmovzxwd + vpslld to inflate to F32 then vfmadd231ps. No JIT yet —
-// the inner loop is hand-vectorised.
+// BF16-weights, FP32-activations gemv:
+//   y[r] = sum_{k=0..cols-1} bf16_to_fp32(W[r*cols + k]) * x[k]   for r in [0, rows).
+// W is BF16 (uint16_t holding the upper 16 bits of an IEEE-754 binary32),
+// x and y are FP32. Routes to a JITted AVX2+FMA kernel cached by
+// (rows, cols) when cols is a multiple of 8 (vpmovzxwd + vpslld 16 +
+// vfmadd231ps); scalar fallback otherwise.
 void nnc_gemv_bf16w_f32x(const void* W, const float* x, float* y,
                          uint32_t rows, uint32_t cols);
 
@@ -101,43 +106,123 @@ int nnc_gemv_bf16w_argmax_f32x(const void* W, const float* x,
 
 // Q8_0 split-layout gemv: y[r] = sum_b scales[r,b] * sum_{k in block b} qs[r,k]*x[k]
 // for r in [0, rows). qs is row-major int8 of size rows*cols; scales is
-// row-major fp32 of size rows*(cols/32). cols must be a positive multiple
+// row-major BF16 of size rows*(cols/32). cols must be a positive multiple
 // of 32. Routes to a JIT 1-row kernel (cols baked) and parallelises the
 // row axis through the same worker pool as the BF16 path when rows is
 // large enough to amortise dispatch.
-void nnc_gemv_q8_0_f32x(const int8_t* qs, const float* scales,
+void nnc_gemv_q8_0_f32x(const int8_t* qs, const uint16_t* scales,
                         const float* x, float* y,
                         uint32_t rows, uint32_t cols);
 
+// Q4 (nnc split 4-bit) gemv. Reconstruction is w = scale*q + bias with q
+// an unsigned nibble in [0, 15], so
+//   y[r] = sum_b [ scales[r,b] * sum_{k in b} q[r,k]*x[k] + biases[r,b] * S[b] ]
+// where S[b] = sum_{k in b} x[k] depends only on x. `xsum` must hold those
+// cols/32 block sums (see nnc_block_sums_f32); passing it in keeps the
+// bias term out of the JIT kernel and off the per-row critical path.
+//
+// qs is row-major packed nibbles of size rows*cols/2; scales and biases
+// are row-major BF16 of size rows*(cols/32). BF16 rather than FP32 halves
+// the metadata traffic (0.75 -> 0.625 bytes/weight), and rather than FP16
+// because a block scale can be arbitrarily small — BF16 keeps FP32's
+// exponent range so it cannot flush to subnormal. cols must be a positive
+// multiple of 32.
+void nnc_gemv_q4_s_f32x(const uint8_t* qs, const uint16_t* scales,
+                        const uint16_t* biases, const float* x,
+                        const float* xsum, float* y,
+                        uint32_t rows, uint32_t cols);
+
+// out[b] = sum of x[b*32 .. b*32+31], for b in [0, n/32). n must be a
+// positive multiple of 32.
+void nnc_block_sums_f32(const float* x, float* out, size_t n);
+
+// ---- batched gemv (prefill) -------------------------------------------
+//
+// Same maths as the single-vector gemvs above, but applied to `n_batch`
+// activation vectors against one pass over the weights. The loop order is
+// row-major outer / batch inner, so each weight row is pulled from DRAM
+// once and then reused from L1 for every vector in the batch — which is
+// the entire point, since decode and prefill are both bandwidth bound.
+//
+// `X` holds n_batch vectors of `cols` floats at `x_stride` floats apart;
+// `Y` holds n_batch vectors of `rows` floats at `y_stride` floats apart.
+// n_batch == 1 is exactly the unbatched call.
+void nnc_gemv_bf16w_f32x_batch(const void* W, const float* X, size_t x_stride,
+                               float* Y, size_t y_stride,
+                               uint32_t rows, uint32_t cols, uint32_t n_batch);
+
+void nnc_gemv_q8_0_f32x_batch(const int8_t* qs, const uint16_t* scales,
+                              const float* X, size_t x_stride,
+                              float* Y, size_t y_stride,
+                              uint32_t rows, uint32_t cols, uint32_t n_batch);
+
+// `XSUM` holds the per-32-block sums of each X vector (see
+// nnc_block_sums_f32), n_batch runs of cols/32 floats at xsum_stride apart.
+void nnc_gemv_q4_s_f32x_batch(const uint8_t* qs, const uint16_t* scales,
+                              const uint16_t* biases,
+                              const float* X, size_t x_stride,
+                              const float* XSUM, size_t xsum_stride,
+                              float* Y, size_t y_stride,
+                              uint32_t rows, uint32_t cols, uint32_t n_batch);
+
 // In-place quantize a row-major BF16 weight matrix [rows x cols] into the
 // Q8_0 split layout: writes `qs[rows*cols]` (int8) followed by
-// `scales[rows*(cols/32)]` (fp32). cols must be a positive multiple of 32.
+// `scales[rows*(cols/32)]` (BF16). cols must be a positive multiple of 32.
 // Uses absmax-per-block scaling: scale = max(|w|)/127, q = round(w/scale).
 void nnc_quantize_bf16_to_q8_0(const uint16_t* W_bf16, int8_t* qs,
-                               float* scales, size_t rows, size_t cols);
+                               uint16_t* scales, size_t rows, size_t cols);
 
-// ---- K-quant dequantizers ---------------------------------------------
+// Same, from FP32 input, over a flat run of `n` elements (n must be a
+// positive multiple of 32). Because Q8_0 blocks are 32 wide and every
+// quantized weight matrix has `cols % 32 == 0`, a flat walk produces
+// exactly the row-major block order the split layout expects — so this
+// can be called incrementally on chunks of a larger matrix.
+void nnc_quantize_f32_to_q8_0(const float* src, int8_t* qs,
+                              uint16_t* scales, size_t n);
+
+// Quantize a flat run of `n` FP32 weights (n a positive multiple of 32)
+// into the nnc split 4-bit layout: writes `qs[n/2]` packed nibbles plus
+// one BF16 `scale` and one BF16 `bias` per 32-element block, such that
+//   w[k] ~= scales[k/32] * q[k] + biases[k/32],   q in [0, 15].
+// Asymmetric (min/max) rather than absmax, which is what makes 4 bits
+// usable: scale = (max-min)/15, bias = min.
 //
-// All three layouts use a 256-element super-block with fp16 super-scales
+// Nibble packing within a block: byte i holds element i in its low
+// nibble and element i+16 in its high nibble.
+void nnc_quantize_f32_to_q4_s(const float* src, uint8_t* qs,
+                              uint16_t* scales, uint16_t* biases, size_t n);
+
+// Returns sum_i bf16_to_f32(a[i]) * b[i]. Used for the Q4 bias term.
+float nnc_dot_bf16_f32_simd(const uint16_t* a, const float* b, size_t n);
+
+// ---- load-time dequantizers -------------------------------------------
+//
+// Q8_0 uses a 32-element block: { fp16 d; int8 qs[32] } = 34 bytes.
+// Q4_K/Q5_K/Q6_K use a 256-element super-block with fp16 super-scales
 // and 6-bit (Q4_K/Q5_K) or 8-bit (Q6_K) per-sub-block scales. Block
-// sizes (matching ggml `block_q*_K`):
+// sizes (matching ggml `block_q*`):
+//   Q8_0 =  34 bytes  (  32 elems)
 //   Q4_K = 144 bytes  ( 256 elems, 4-bit qs)
 //   Q5_K = 176 bytes  ( 256 elems, 4-bit qs + 1-bit qh)
 //   Q6_K = 210 bytes  ( 256 elems, 4-bit ql + 2-bit qh + i8 scales)
 //
-// `n_elements` must be a positive multiple of 256. `blocks` points at
-// the first packed block; `dst` receives `n_elements` contiguous
-// floats. Scalar reference implementations (no SIMD yet); used at load
-// time to dequant K-quant weights into a denser format that the
-// existing BF16 / Q8_0 gemv kernels can consume.
+// `n_elements` must be a positive multiple of the type's block size.
+// `blocks` points at the first packed block; `dst` receives
+// `n_elements` contiguous floats. Scalar implementations: these run
+// once at load time, feeding the BF16 / Q8_0 gemv kernels.
+void nnc_dequantize_q8_0_to_f32(const void* blocks, float* dst, size_t n_elements);
 void nnc_dequantize_q4_k_to_f32(const void* blocks, float* dst, size_t n_elements);
 void nnc_dequantize_q5_k_to_f32(const void* blocks, float* dst, size_t n_elements);
 void nnc_dequantize_q6_k_to_f32(const void* blocks, float* dst, size_t n_elements);
 
-// Dispatch by the GGUF / ggml type code (12=Q4_K, 13=Q5_K, 14=Q6_K).
-// Returns false (and leaves dst untouched) for unsupported types.
-bool nnc_dequantize_kquant_to_f32(uint32_t ggml_type, const void* blocks,
-                                  float* dst, size_t n_elements);
+// Elements per storage block for a GGUF / ggml quantized type code.
+// Returns 0 for types this build cannot decode.
+uint32_t nnc_quant_block_elems(uint32_t ggml_type);
+
+// Dispatch by the GGUF / ggml type code (8=Q8_0, 12=Q4_K, 13=Q5_K,
+// 14=Q6_K). Returns false (and leaves dst untouched) for other types.
+bool nnc_dequantize_to_f32(uint32_t ggml_type, const void* blocks,
+                           float* dst, size_t n_elements);
 
 // Fused SwiGLU activation used by Gemma / Llama MLPs:
 //   y[i] = silu(gate[i]) * up[i]   where silu(x) = x * sigmoid(x).
@@ -185,15 +270,13 @@ void nnc_softcap_f32(float* y, const float* x, size_t n, float cap);
 void nnc_embed_row_bf16(float* y, const void* table, int token_id,
                         size_t n_embd, float scale);
 
-// --- graph-level fusion (mul_mat -> repeat(bias) -> add) ---
-struct nnc_cgraph;
-struct nnc_tensor;
+// Same, from a Q8_0 split-layout table: qs is row-major int8 of size
+// rows*n_embd, scales is row-major BF16 of size rows*(n_embd/32).
+// n_embd must be a positive multiple of 32.
+void nnc_embed_row_q8_0(float* y, const int8_t* qs, const uint16_t* scales,
+                        int token_id, size_t n_embd, float scale);
 
-void nnc_graph_prefuse(const struct nnc_cgraph* g);
-bool nnc_should_skip(const struct nnc_tensor* node);
-const float* nnc_fused_bias_for(const struct nnc_tensor* mul_mat_node);
-// When non-null, the fused mul_mat must write its output here (the ADD's
-// destination buffer) so downstream nodes consuming the ADD see the result.
-void* nnc_fused_dst_for(const struct nnc_tensor* mul_mat_node);
-// True when this mul_mat has a fused trailing GELU (apply after bias add).
-bool nnc_fused_gelu_for(const struct nnc_tensor* mul_mat_node);
+// Same, from a Q4 split-layout table (BF16 scales/biases).
+void nnc_embed_row_q4_s(float* y, const uint8_t* qs, const uint16_t* scales,
+                        const uint16_t* biases, int token_id,
+                        size_t n_embd, float scale);

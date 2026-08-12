@@ -45,14 +45,11 @@ public:
 	// acc <- acc + a * b   (register-register form)
 	void vfmadd231ps_ymm_ymm_ymm(ymm acc, ymm a, ymm b);
 
-	// ymm dst <- vcvtph2ps(xmmword [base + disp32])  (8 halves -> 8 floats)
-	void vcvtph2ps_ymm_load_base_disp32(ymm dst, gpr base, int32_t disp);
+	// acc <- acc + a * [base + index*8]        (mod=00 SIB, scale 8)
+	void vfmadd231ps_ymm_mem_basex8(ymm acc, ymm a, gpr base, gpr index);
 
-	// ymm dst <- vcvtph2ps(xmmword [base + index*2])  (8 halves -> 8 floats)
-	void vcvtph2ps_ymm_load_basex2(ymm dst, gpr base, gpr index);
-
-	// ymm dst <- vcvtph2ps(xmmword [base + index*2 + disp8])  (mod=01 SIB)
-	void vcvtph2ps_ymm_load_basex2_disp8(ymm dst, gpr base, gpr index, int8_t disp);
+	// acc <- acc + a * [base + index*8 + disp8]  (mod=01 SIB, scale 8)
+	void vfmadd231ps_ymm_mem_basex8_disp8(ymm acc, ymm a, gpr base, gpr index, int8_t disp);
 
 	// ymm dst <- vpmovzxwd(xmmword [base + index*2])  (8 u16 -> 8 u32, zero-ext)
 	void vpmovzxwd_ymm_load_basex2(ymm dst, gpr base, gpr index);
@@ -66,12 +63,39 @@ public:
 	// ymm dst <- vpmovsxbd(qword [base + index])  (8 i8 -> 8 i32, sign-ext)
 	void vpmovsxbd_ymm_load_basex1(ymm dst, gpr base, gpr index);
 
+	// ymm dst <- vpmovzxbd(qword [base + index])  (8 u8 -> 8 u32, zero-ext)
+	void vpmovzxbd_ymm_load_basex1(ymm dst, gpr base, gpr index);
+
+	// ymm dst <- vpmovzxbd(qword [base + index + disp8])  (mod=01 SIB)
+	void vpmovzxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index, int8_t disp);
+
+	// ymm dst <- [base + index*8]        (mod=00 SIB, scale 8)
+	void vmovups_ymm_load_basex8(ymm dst, gpr base, gpr index);
+
+	// ymm dst <- [base + index*8 + disp8]  (mod=01 SIB, scale 8)
+	void vmovups_ymm_load_basex8_disp8(ymm dst, gpr base, gpr index, int8_t disp);
+
+	// dst <- a & b
+	void vpand_ymm(ymm dst, ymm a, ymm b);
+
+	// dst <- a == b, per dword (all-ones on equal). vpcmpeqd y,y,y is the
+	// cheapest way to materialise an all-ones vector without a constant pool.
+	void vpcmpeqd_ymm(ymm dst, ymm a, ymm b);
+
+	// dst <- src >> imm, per dword, shifting in zeros
+	void vpsrld_ymm_imm8(ymm dst, ymm src, uint8_t imm);
+
 	// ymm dst <- vpmovsxbd(qword [base + index + disp8])  (mod=01 SIB)
 	void vpmovsxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index, int8_t disp);
 
 	// ymm dst <- vbroadcastss(dword [base])  (one f32 -> 8 lanes)
 	// base must NOT be rsp/rbp/r12/r13 (those need SIB / explicit disp).
 	void vbroadcastss_ymm_load_base(ymm dst, gpr base);
+
+	// ymm dst <- vpbroadcastw(word [base])  (one u16 -> 16 word lanes).
+	// Paired with vpslld 16 this expands a bf16 scalar to 8 f32 lanes
+	// without needing F16C.
+	void vpbroadcastw_ymm_load_base(ymm dst, gpr base);
 
 	// ymm dst <- vcvtdq2ps(ymm src)  (8 i32 -> 8 f32)
 	void vcvtdq2ps_ymm_ymm(ymm dst, ymm src);

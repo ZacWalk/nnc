@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -236,18 +237,18 @@ static int inspect_model_for_nnc(const char* path)
 	}
 
 	// --- nnc compatibility verdict --------------------------------------
-	// Currently nnc supports gemma4 only, BF16/F16/F32/Q8_0 weight types.
-	// (We can fold in Q4_K etc. once the kernels exist.)
-	const bool arch_ok = (arch == "gemma4");
+	// gemma.cpp's loader accepts gemma4 (3n), gemma3, and llama. Weight
+	// dtypes it can materialise: F32, F16, BF16 straight from the mmap,
+	// plus Q8_0/Q4_K/Q5_K/Q6_K decoded once at load time.
+	const bool arch_ok = (arch == "gemma4" || arch == "gemma3" || arch == "llama");
 	bool types_ok = true;
 	for (const auto& kv : type_count)
 	{
-		// Mirrors the dtype enum in runtime.h: F32=0, F16=1, BF16=30.
-		// Q8_0 (=8) is the only quantised type we currently load (and
-		// only via the in-process gemma_quantize_q8_0 conversion, not
-		// from disk yet). Anything else would need new dequant code.
+		// ggml type codes: F32=0, F16=1, Q8_0=8, Q4_K=12, Q5_K=13,
+		// Q6_K=14, BF16=30.
 		const uint32_t t = kv.first;
-		const bool ok = (t == 0 /*F32*/) || (t == 1 /*F16*/) || (t == 30 /*BF16*/);
+		const bool ok = (t == 0) || (t == 1) || (t == 30)
+			|| (t == 8) || (t == 12) || (t == 13) || (t == 14);
 		if (!ok)
 		{
 			types_ok = false;
@@ -257,9 +258,9 @@ static int inspect_model_for_nnc(const char* path)
 	printf("\nnnc compatibility:\n");
 	printf("  architecture supported: %s%s\n",
 	       arch_ok ? "yes" : "no",
-	       arch_ok ? "" : "  (only 'gemma4' is wired up today)");
+	       arch_ok ? "" : "  (only 'gemma4', 'gemma3' and 'llama' are wired up today)");
 	printf("  tensor dtypes supported: %s\n",
-	       types_ok ? "yes (all F32/F16/BF16)" : "no  (see histogram above)");
+	       types_ok ? "yes (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K)" : "no  (see histogram above)");
 	if (!arch_ok)
 	{
 		printf("  -> to load this, add a loader/forward for arch '%s' "
@@ -268,7 +269,7 @@ static int inspect_model_for_nnc(const char* path)
 	if (!types_ok)
 	{
 		printf("  -> to load this, add a dequant path for the new tensor "
-		       "types (e.g. Q4_K/Q5_K/Q6_K) in nn_ops.cpp / jit_ops.cpp.\n");
+		       "types (e.g. Q2_K/Q3_K/IQ*) in nn_ops.cpp.\n");
 	}
 
 	return 0;
@@ -297,28 +298,29 @@ int main(int argc, char** argv)
 	sys_init_console();
 
 	// Pre-scan for global flags that aren't tied to a specific subcommand.
-	// Q8_0 quantisation of the dominant weight tensors is ON by default;
-	// pass `--bf16` (or `-bf16`) to keep weights as raw BF16. Applies to
-	// any code path that calls gemma_load.
-	bool quantize_q8 = true;
+	// Q8_0 weights are the default; `--bf16` keeps the source values and
+	// `--q4` halves the bytes again. `--perf` turns on the phase profiler.
+	gemma_weight_fmt wfmt = GEMMA_W_Q8_0;
 	for (int i = 1; i < argc; i++)
 	{
 		const char* a = argv[i];
 		if (strcmp(a, "--bf16") == 0 || strcmp(a, "-bf16") == 0)
 		{
-			quantize_q8 = false;
+			wfmt = GEMMA_W_BF16;
 		}
 		else if (strcmp(a, "--q8") == 0 || strcmp(a, "-q8") == 0)
 		{
-			quantize_q8 = true; // accepted for back-compat; this is the default
+			wfmt = GEMMA_W_Q8_0; // the default; accepted for back-compat
+		}
+		else if (strcmp(a, "--q4") == 0 || strcmp(a, "-q4") == 0)
+		{
+			wfmt = GEMMA_W_Q4;
+		}
+		else if (strcmp(a, "--perf") == 0 || strcmp(a, "-perf") == 0)
+		{
+			nnc_perf_enable(true);
 		}
 	}
-
-	auto maybe_quantize = [&](gemma_file& gf) -> bool
-	{
-		if (!quantize_q8) return true;
-		return gemma_quantize_q8_0(gf);
-	};
 
 	// Pre-scan for an explicit `-m` / `--model` so we know whether to
 	// run the interactive model picker on REPL startup.
@@ -464,8 +466,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 			gemma_print_info(gf);
 			gemma_free(gf);
 			return 0;
@@ -487,8 +488,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 			int tok = gf.bos_id;
 			if (i + 2 < argc && !parse_int_strict(argv[i + 2], &tok))
 			{
@@ -518,8 +518,7 @@ int main(int argc, char** argv)
 			}
 			nnc_time_init();
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 			int tok = gf.bos_id;
 			if (i + 2 < argc && !parse_int_strict(argv[i + 2], &tok))
 			{
@@ -549,8 +548,7 @@ int main(int argc, char** argv)
 			}
 			nnc_time_init();
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 
 			std::vector<int> prompt;
 			{
@@ -639,8 +637,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 			const std::vector<int> toks = gemma_tokenize(gf, argv[i + 2], gf.add_bos_token);
 			printf("input    : %s\n", argv[i + 2]);
 			printf("tokens   : %zu\n", toks.size());
@@ -693,8 +690,7 @@ int main(int argc, char** argv)
 			}
 			nnc_time_init();
 			gemma_file gf{};
-			if (!gemma_load(argv[i + 1], gf)) return 1;
-			if (!maybe_quantize(gf)) return 1;
+			if (!gemma_load(argv[i + 1], gf, wfmt)) return 1;
 			const std::vector<int> prompt = gemma_tokenize(gf, argv[i + 2], gf.add_bos_token);
 			int n_predict = 16;
 			if (i + 3 < argc && !parse_int_strict(argv[i + 3], &n_predict))
@@ -722,7 +718,6 @@ int main(int argc, char** argv)
 	}
 
 	nnc_time_init();
-	const int64_t t_main_start_us = nnc_time_us();
 
 	gpt_params params;
 	params.model = "models/gemma-4-E2B-it-BF16.gguf";
@@ -770,13 +765,12 @@ int main(int argc, char** argv)
 		fflush(stdout);
 
 		gemma_file gf{};
-		if (!gemma_load(params.model.c_str(), gf))
+		if (!gemma_load(params.model.c_str(), gf, wfmt))
 		{
 			fprintf(stderr, "%s: failed to load gemma model from '%s'\n",
 			        __func__, params.model.c_str());
 			return 1;
 		}
-		if (!maybe_quantize(gf)) return 1;
 
 		const auto& h = gf.hparams;
 		const int n_predict = params.n_predict > 0 ? params.n_predict : 256;
@@ -824,7 +818,7 @@ int main(int argc, char** argv)
 		// (or `/quit`) to leave.
 		constexpr int n_ctx = 4096;
 		gemma_kv_cache cache;
-		if (!gemma_kv_init(gf, cache, n_ctx))
+		if (!gemma_kv_init(gf, cache, n_ctx, GEMMA_PREFILL_BATCH))
 		{
 			fprintf(stderr, "nnc: failed to init kv cache\n");
 			gemma_free(gf);
@@ -892,22 +886,26 @@ int main(int argc, char** argv)
 				}
 			}
 
-			// Prefill prompt tokens (no output) starting at the current
-			// cache position. Use the argmax-only path: it never
-			// materialises the n_vocab-sized logits buffer (saves ~1 MB
-			// of writes per token at vocab=262144) and skips softcap.
+			// Prefill the prompt in batches: one pass over the weights
+			// serves up to GEMMA_PREFILL_BATCH tokens. Only the last
+			// token's prediction is needed to start decoding.
+			nnc_perf_reset();
+			int n_eval = 0;
 			const int base_pos = cache.cur_pos;
 			int next = -1;
 			bool ok = true;
-			for (size_t i = 0; i < prompt.size(); ++i)
+			for (size_t i = 0; i < prompt.size(); i += GEMMA_PREFILL_BATCH)
 			{
-				if (gemma_eval_token_argmax(gf, cache, prompt[i],
-				                            base_pos + static_cast<int>(i),
-				                            &next) != 0)
+				const int chunk = static_cast<int>(
+					std::min<size_t>(GEMMA_PREFILL_BATCH, prompt.size() - i));
+				if (gemma_eval_tokens_argmax(gf, cache, prompt.data() + i, chunk,
+				                             base_pos + static_cast<int>(i),
+				                             &next) != 0)
 				{
 					ok = false;
 					break;
 				}
+				n_eval += chunk;
 			}
 			if (!ok) continue;
 
@@ -935,9 +933,11 @@ int main(int argc, char** argv)
 				if (cache.cur_pos >= n_ctx) break;
 				if (gemma_eval_token_argmax(gf, cache, next, cache.cur_pos, &next) != 0)
 					break;
+				++n_eval;
 			}
 			fflush(stdout);
 			printf("\n");
+			if (nnc_perf_enabled()) nnc_perf_report("turn", n_eval);
 		}
 
 		gemma_kv_free(cache);

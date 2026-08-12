@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -225,93 +226,6 @@ namespace
 		return true;
 	}
 
-	// ---- nn_ops: dot_f16_to_f32 (Stage B) ---------------------------------
-
-	// IEEE 754 binary32 -> binary16, round-to-nearest-even.
-	uint16_t fp32_to_fp16(const float f)
-	{
-		uint32_t bits;
-		std::memcpy(&bits, &f, 4);
-		const uint32_t s = (bits >> 31) & 0x1u;
-		int32_t e = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
-		const uint32_t m = bits & 0x7FFFFFu;
-
-		if (e >= 31) return static_cast<uint16_t>((s << 15) | (0x1Fu << 10)); // overflow -> inf
-		if (e <= 0) return static_cast<uint16_t>(s << 15); // underflow -> 0
-		// round-to-nearest-even on the 13 dropped bits
-		const uint32_t round = (m >> 12) & 1u;
-		const uint32_t sticky = (m & 0xFFFu) ? 1u : 0u;
-		uint32_t mh = (m >> 13) + (round & (sticky | ((m >> 13) & 1u)));
-		if (mh & 0x400u)
-		{
-			mh = 0;
-			++e;
-			if (e >= 31) return static_cast<uint16_t>((s << 15) | (0x1Fu << 10));
-		}
-		return static_cast<uint16_t>((s << 15) | (static_cast<uint32_t>(e) << 10) | (mh & 0x3FFu));
-	}
-
-	float fp16_to_fp32(const uint16_t h)
-	{
-		const uint32_t s = (h >> 15) & 0x1u;
-		const uint32_t e = (h >> 10) & 0x1Fu;
-		const uint32_t m = h & 0x3FFu;
-		uint32_t bits;
-		if (e == 0) bits = s << 31;
-		else if (e == 31) bits = (s << 31) | (0xFFu << 23) | (m << 13);
-		else bits = (s << 31) | ((e + (127 - 15)) << 23) | (m << 13);
-		float f;
-		std::memcpy(&f, &bits, 4);
-		return f;
-	}
-
-	bool dot_f16_one(const size_t n, std::mt19937& rng)
-	{
-		std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-		std::vector<uint16_t> x(n), y(n);
-		for (size_t i = 0; i < n; ++i)
-		{
-			x[i] = fp32_to_fp16(dist(rng));
-			y[i] = fp32_to_fp16(dist(rng));
-		}
-
-		// Reference: convert halves back to floats and accumulate in double.
-		double ref = 0.0;
-		for (size_t i = 0; i < n; ++i)
-		{
-			ref += static_cast<double>(fp16_to_fp32(x[i]))
-				* static_cast<double>(fp16_to_fp32(y[i]));
-		}
-
-		const float got = nnc_dot_f16_to_f32(x.data(), y.data(), n);
-		const float tol = 1e-3f * std::max(1.0f, std::fabs(static_cast<float>(ref)));
-		if (std::fabs(got - static_cast<float>(ref)) > tol)
-		{
-			std::printf("    dot_f16 n=%zu got=%g ref=%g diff=%g tol=%g\n",
-			            n, got, static_cast<double>(ref),
-			            std::fabs(got - ref), tol);
-			return false;
-		}
-		return true;
-	}
-
-	bool test_nnc_dot_f16_to_f32()
-	{
-		std::mt19937 rng(0xF16C);
-		// JIT path sizes (multiples of 32) — covers GPT-2 117M shapes 64, 768, 3072
-		// plus a few corners.
-		for (const size_t n : {32u, 64u, 256u, 768u, 1024u, 3072u, 4096u})
-		{
-			if (!dot_f16_one(n, rng)) return false;
-		}
-		// Scalar fallback path (not multiple of 32).
-		for (const size_t n : {1u, 7u, 33u, 100u})
-		{
-			if (!dot_f16_one(n, rng)) return false;
-		}
-		return true;
-	}
-
 	// ---- nn_ops: softmax + layernorm (Stage C) -----------------------------
 
 	bool test_nnc_softmax_f32()
@@ -338,13 +252,28 @@ namespace
 		}
 
 		// -INFINITY masks: those entries must become 0 and the rest sum to 1.
-		float q[5] = {0.5f, -INFINITY, 1.5f, -INFINITY, 2.5f};
+		constexpr float ninf = -std::numeric_limits<float>::infinity();
+		float q[5] = {0.5f, ninf, 1.5f, ninf, 2.5f};
 		nnc_softmax_f32_inplace(q, 5);
 		if (q[1] != 0.0f || q[3] != 0.0f) return false;
 		const float total = q[0] + q[1] + q[2] + q[3] + q[4];
 		if (!close(total, 1.0f, 1e-6f)) return false;
 		// Strictly increasing for the unmasked entries.
 		if (!(q[0] < q[2] && q[2] < q[4])) return false;
+
+		// Same, but long enough to exercise the AVX2 path (n >= 8).
+		{
+			float w[16];
+			for (int i = 0; i < 16; ++i) w[i] = (i % 3 == 0) ? ninf : static_cast<float>(i);
+			nnc_softmax_f32_inplace(w, 16);
+			double wsum = 0;
+			for (int i = 0; i < 16; ++i)
+			{
+				if (i % 3 == 0 && w[i] != 0.0f) return false;
+				wsum += w[i];
+			}
+			if (std::fabs(wsum - 1.0) > 1e-6) return false;
+		}
 
 		// Random vector: result sums to 1, all >= 0.
 		std::mt19937 rng(0xC0FFEE);
@@ -450,70 +379,6 @@ namespace
 			for (size_t i = 0; i < n; ++i)
 				if (!close(z[i], y[i], 1e-5f)) return false;
 		}
-		return true;
-	}
-
-	// ---- nn_ops: gemv_f16w_f32x (Stage D — fused mul_mat) -----------------
-
-	bool gemv_f16w_one(const uint32_t rows, const uint32_t cols, std::mt19937& rng)
-	{
-		std::uniform_real_distribution<float> wdist(-0.5f, 0.5f);
-		std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
-
-		std::vector<uint16_t> W(static_cast<size_t>(rows) * cols);
-		std::vector<float> x(cols);
-		std::vector<float> y(rows, 0.0f);
-
-		for (auto& w : W) w = fp32_to_fp16(wdist(rng));
-		for (auto& v : x) v = xdist(rng);
-
-		nnc_gemv_f16w_f32x(W.data(), x.data(), y.data(), rows, cols);
-
-		// Reference: same algorithm, double accumulation.
-		for (uint32_t r = 0; r < rows; ++r)
-		{
-			double s = 0.0;
-			const uint16_t* row = W.data() + static_cast<size_t>(r) * cols;
-			for (uint32_t k = 0; k < cols; ++k)
-			{
-				s += static_cast<double>(fp16_to_fp32(row[k])) * x[k];
-			}
-			const float ref = static_cast<float>(s);
-			const float tol = 1e-3f * std::max(1.0f, std::fabs(ref));
-			if (std::fabs(y[r] - ref) > tol)
-			{
-				std::printf("    gemv_f16w r=%u rows=%u cols=%u got=%g ref=%g diff=%g tol=%g\n",
-				            r, rows, cols, y[r], ref,
-				            std::fabs(y[r] - ref), tol);
-				return false;
-			}
-		}
-		return true;
-	}
-
-	bool test_nnc_gemv_f16w_f32x()
-	{
-		std::mt19937 rng(0x6EF5);
-		// JIT path (cols multiple of 8). Covers GPT-2 117M shapes:
-		//   768 -> 768 (Q,K,V proj, FFN_out output)
-		//   768 -> 3072 (FFN_in)
-		//   3072 -> 768 (FFN_out)
-		//   768 -> 50257 (vocab projection — large rows, exercises rel32)
-		struct sh
-		{
-			uint32_t rows, cols;
-		};
-		const sh shapes[] = {
-			{1, 8}, {4, 64}, {16, 128},
-			{768, 768}, {3072, 768}, {768, 3072},
-			{50257, 768},
-		};
-		for (const auto s : shapes)
-		{
-			if (!gemv_f16w_one(s.rows, s.cols, rng)) return false;
-		}
-		// Scalar fallback (cols not a multiple of 8).
-		if (!gemv_f16w_one(7, 5, rng)) return false;
 		return true;
 	}
 
@@ -693,14 +558,14 @@ namespace
 			Wf[i] = nnc_bf16_to_f32(W[i]); // re-quantize for fair compare
 		}
 		std::vector<int8_t> qs(rows * cols);
-		std::vector<float> scales(rows * (cols / 32));
+		std::vector<uint16_t> scales(rows * (cols / 32));
 		nnc_quantize_bf16_to_q8_0(W.data(), qs.data(), scales.data(), rows, cols);
 
 		for (size_t r = 0; r < rows; ++r)
 		{
 			for (size_t b = 0; b < cols / 32; ++b)
 			{
-				const float scale = scales[r * (cols / 32) + b];
+				const float scale = nnc_bf16_to_f32(scales[r * (cols / 32) + b]);
 				// Step size = scale; allow one step of error.
 				for (size_t k = 0; k < 32; ++k)
 				{
@@ -740,7 +605,7 @@ namespace
 			for (auto& w : W) w = nnc_f32_to_bf16(d(rng));
 
 			std::vector<int8_t> qs(W.size());
-			std::vector<float> scales(static_cast<size_t>(s.rows) * (s.cols / 32));
+			std::vector<uint16_t> scales(static_cast<size_t>(s.rows) * (s.cols / 32));
 			nnc_quantize_bf16_to_q8_0(W.data(), qs.data(), scales.data(),
 			                          s.rows, s.cols);
 
@@ -757,7 +622,7 @@ namespace
 				double acc = 0.0;
 				for (uint32_t b = 0; b < scale_stride; ++b)
 				{
-					const float scale = scales[r * scale_stride + b];
+					const float scale = nnc_bf16_to_f32(scales[r * scale_stride + b]);
 					for (uint32_t k = 0; k < 32; ++k)
 					{
 						const float w = scale * qs[r * s.cols + b * 32 + k];
@@ -780,7 +645,188 @@ namespace
 		return true;
 	}
 
-	// ---- nn_ops: K-quant dequantizers ------------------------------------
+	// ---- nn_ops: Q4 (nnc split 4-bit) -------------------------------------
+
+	bool test_nnc_q4_s_quantize_roundtrip()
+	{
+		// Case 1: scale and bias exactly representable in BF16 (powers of
+		// two), and the values sit exactly on the 16 quantization levels.
+		// Round-trip must then be bit-exact, which pins down the nibble
+		// packing rather than just the numerics.
+		{
+			std::vector<float> src(64);
+			for (int i = 0; i < 32; ++i) src[i] = -2.0f + static_cast<float>(i % 16) * 0.25f;
+			for (int i = 0; i < 32; ++i) src[32 + i] = 4.0f + static_cast<float>(i % 16) * 0.5f;
+
+			std::vector<uint8_t> qs(32);
+			std::vector<uint16_t> scales(2), biases(2);
+			nnc_quantize_f32_to_q4_s(src.data(), qs.data(), scales.data(), biases.data(), 64);
+
+			const float expect_scale[2] = {0.25f, 0.5f};
+			const float expect_bias[2] = {-2.0f, 4.0f};
+			for (size_t b = 0; b < 2; ++b)
+			{
+				const float sc = nnc_bf16_to_f32(scales[b]);
+				const float bi = nnc_bf16_to_f32(biases[b]);
+				if (sc != expect_scale[b] || bi != expect_bias[b]) return false;
+				for (size_t k = 0; k < 16; ++k)
+				{
+					const uint8_t byte = qs[b * 16 + k];
+					// byte i holds element i low, element i+16 high.
+					if (sc * (byte & 0x0F) + bi != src[b * 32 + k]) return false;
+					if (sc * (byte >> 4) + bi != src[b * 32 + k + 16]) return false;
+				}
+			}
+		}
+
+		// Case 2: arbitrary values. BF16 carries 8 significand bits, so the
+		// reconstruction error is bounded by the scale and bias rounding
+		// amplified by the largest quant level:
+		//   |err| <= 15*scale*2^-8 + |bias|*2^-8 = (range + |bias|) * 2^-8
+		{
+			std::mt19937 rng(0x4B15);
+			std::uniform_real_distribution<float> d(-3.0f, 7.0f);
+			std::vector<float> src(32);
+			for (auto& v : src) v = d(rng);
+
+			uint8_t qs[16];
+			uint16_t sc_h, bi_h;
+			nnc_quantize_f32_to_q4_s(src.data(), qs, &sc_h, &bi_h, 32);
+
+			const float sc = nnc_bf16_to_f32(sc_h);
+			const float bi = nnc_bf16_to_f32(bi_h);
+			// Half a quant step, plus the BF16 rounding of scale and bias.
+			const float step = 15.0f * sc;
+			const float tol = 0.5f * sc + (step + std::fabs(bi)) * 0.00391f + 1e-6f;
+			for (size_t k = 0; k < 16; ++k)
+			{
+				if (std::fabs(sc * (qs[k] & 0x0F) + bi - src[k]) > tol) return false;
+				if (std::fabs(sc * (qs[k] >> 4) + bi - src[k + 16]) > tol) return false;
+			}
+		}
+
+		// Degenerate block: all values equal -> scale 0, bias = the value.
+		std::vector<float> flat(32, 3.5f);
+		uint8_t fq[16];
+		uint16_t fs, fb;
+		nnc_quantize_f32_to_q4_s(flat.data(), fq, &fs, &fb, 32);
+		if (nnc_bf16_to_f32(fs) != 0.0f) return false;
+		if (nnc_bf16_to_f32(fb) != 3.5f) return false;
+		for (const unsigned char v : fq) if (v != 0) return false;
+		return true;
+	}
+
+	bool test_nnc_block_sums_f32()
+	{
+		std::vector<float> x(128);
+		std::mt19937 rng(0xB10C);
+		std::uniform_real_distribution<float> d(-4.0f, 4.0f);
+		for (auto& v : x) v = d(rng);
+
+		float out[4];
+		nnc_block_sums_f32(x.data(), out, x.size());
+		for (int b = 0; b < 4; ++b)
+		{
+			double ref = 0.0;
+			for (int k = 0; k < 32; ++k) ref += x[b * 32 + k];
+			if (!close(out[b], static_cast<float>(ref), 1e-5f)) return false;
+		}
+		return true;
+	}
+
+	bool test_nnc_gemv_q4_s_f32x()
+	{
+		// Compare the JIT 4-bit gemv against a scalar reference computed
+		// from the SAME quantized weights, so the only error source is
+		// summation order.
+		std::mt19937 rng(0x40E5);
+		std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+		struct sh
+		{
+			uint32_t rows, cols;
+		};
+		const sh shapes[] = {
+			{1, 32}, {8, 64}, {64, 128},
+			{256, 256}, {512, 512}, {1024, 2048},
+		};
+		for (const auto s : shapes)
+		{
+			const size_t n = static_cast<size_t>(s.rows) * s.cols;
+			const size_t nblocks = s.cols / 32;
+			std::vector<float> W(n);
+			for (auto& w : W) w = d(rng);
+
+			std::vector<uint8_t> qs(n / 2);
+			std::vector<uint16_t> scales(static_cast<size_t>(s.rows) * nblocks);
+			std::vector<uint16_t> biases(scales.size());
+			// Row by row: the layout is row-major over blocks.
+			for (uint32_t r = 0; r < s.rows; ++r)
+				nnc_quantize_f32_to_q4_s(W.data() + r * s.cols,
+				                         qs.data() + r * (s.cols / 2),
+				                         scales.data() + r * nblocks,
+				                         biases.data() + r * nblocks,
+				                         s.cols);
+
+			std::vector<float> x(s.cols), y(s.rows), xsum(nblocks);
+			for (auto& v : x) v = d(rng);
+			nnc_block_sums_f32(x.data(), xsum.data(), s.cols);
+
+			nnc_gemv_q4_s_f32x(qs.data(), scales.data(), biases.data(),
+			                   x.data(), xsum.data(), y.data(), s.rows, s.cols);
+
+			for (uint32_t r = 0; r < s.rows; ++r)
+			{
+				double acc = 0.0;
+				for (size_t b = 0; b < nblocks; ++b)
+				{
+					const float sc = nnc_bf16_to_f32(scales[r * nblocks + b]);
+					const float bi = nnc_bf16_to_f32(biases[r * nblocks + b]);
+					const uint8_t* blk = qs.data() + r * (s.cols / 2) + b * 16;
+					for (size_t k = 0; k < 16; ++k)
+					{
+						acc += static_cast<double>(sc * (blk[k] & 0x0F) + bi) * x[b * 32 + k];
+						acc += static_cast<double>(sc * (blk[k] >> 4) + bi) * x[b * 32 + k + 16];
+					}
+				}
+				const float ref = static_cast<float>(acc);
+				const float tol = 1e-3f * std::max(1.0f, std::fabs(ref));
+				if (std::fabs(y[r] - ref) > tol)
+				{
+					std::printf("    q4 gemv r=%u y=%g ref=%g (rows=%u cols=%u)\n",
+					            r, y[r], ref, s.rows, s.cols);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// ---- nn_ops: load-time dequantizers ----------------------------------
+
+	// IEEE 754 binary32 -> binary16, round-to-nearest-even. Used to build
+	// the fp16 scales in the synthetic quantized blocks below.
+	uint16_t fp32_to_fp16(const float f)
+	{
+		uint32_t bits;
+		std::memcpy(&bits, &f, 4);
+		const uint32_t s = (bits >> 31) & 0x1u;
+		int32_t e = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+		const uint32_t m = bits & 0x7FFFFFu;
+
+		if (e >= 31) return static_cast<uint16_t>((s << 15) | (0x1Fu << 10)); // overflow -> inf
+		if (e <= 0) return static_cast<uint16_t>(s << 15); // underflow -> 0
+		// round-to-nearest-even on the 13 dropped bits
+		const uint32_t round = (m >> 12) & 1u;
+		const uint32_t sticky = (m & 0xFFFu) ? 1u : 0u;
+		uint32_t mh = (m >> 13) + (round & (sticky | ((m >> 13) & 1u)));
+		if (mh & 0x400u)
+		{
+			mh = 0;
+			++e;
+			if (e >= 31) return static_cast<uint16_t>((s << 15) | (0x1Fu << 10));
+		}
+		return static_cast<uint16_t>((s << 15) | (static_cast<uint32_t>(e) << 10) | (mh & 0x3FFu));
+	}
 
 	// Helper: build a Q4_K block where every super-scale = 1, every
 	// sub-block scale = 1 and min = 0, so dequant(qs) == per-nibble
@@ -798,6 +844,34 @@ namespace
 		// High 2 bits of scale come from sc[0..3]>>6 (=0). Want scale=1.
 		sc[8] = 0x01; sc[9] = 0x01; sc[10] = 0x01; sc[11] = 0x01;
 		std::memcpy(out + 16, qs, 128);
+	}
+
+	bool test_nnc_dequantize_q8_0()
+	{
+		// block_q8_0 = { fp16 d; int8 qs[32] }. Two blocks with distinct
+		// scales; dequant must yield d * qs exactly.
+		uint8_t blocks[68];
+		const uint16_t d0 = fp32_to_fp16(0.25f);
+		const uint16_t d1 = fp32_to_fp16(-2.0f);
+		std::memcpy(blocks + 0, &d0, 2);
+		std::memcpy(blocks + 34, &d1, 2);
+		for (int k = 0; k < 32; ++k)
+		{
+			blocks[2 + k] = static_cast<uint8_t>(static_cast<int8_t>(k - 16));
+			blocks[36 + k] = static_cast<uint8_t>(static_cast<int8_t>(127 - k * 4));
+		}
+
+		float out[64];
+		nnc_dequantize_q8_0_to_f32(blocks, out, 64);
+		for (int k = 0; k < 32; ++k)
+		{
+			if (!close(out[k], 0.25f * (k - 16), 1e-6f)) return false;
+			if (!close(out[32 + k], -2.0f * (127 - k * 4), 1e-6f)) return false;
+		}
+		if (nnc_quant_block_elems(8) != 32) return false;
+		if (nnc_quant_block_elems(14) != 256) return false;
+		if (nnc_quant_block_elems(30) != 0) return false;
+		return true;
 	}
 
 	bool test_nnc_dequantize_q4_k()
@@ -1064,6 +1138,82 @@ namespace
 		}
 		return true;
 	}
+
+	bool test_nnc_embed_row_q8_0()
+	{
+		// Quantize a synthetic table, then check the row lookup matches a
+		// scalar dequant of the same row.
+		constexpr size_t n_embd = 64; // multiple of 32
+		constexpr size_t n_vocab = 7;
+		std::vector<float> src(n_vocab * n_embd);
+		std::mt19937 rng(0x0800);
+		std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+		for (auto& v : src) v = d(rng);
+
+		std::vector<int8_t> qs(n_vocab * n_embd);
+		std::vector<uint16_t> scales(n_vocab * n_embd / 32);
+		nnc_quantize_f32_to_q8_0(src.data(), qs.data(), scales.data(), src.size());
+
+		constexpr int tok = 5;
+		constexpr float scale = 0.75f;
+		std::vector<float> y(n_embd);
+		nnc_embed_row_q8_0(y.data(), qs.data(), scales.data(), tok, n_embd, scale);
+
+		constexpr size_t nblocks = n_embd / 32;
+		for (size_t i = 0; i < n_embd; ++i)
+		{
+			const size_t gi = tok * n_embd + i;
+			const float ref = static_cast<float>(qs[gi])
+				* nnc_bf16_to_f32(scales[tok * nblocks + i / 32]) * scale;
+			if (!close(y[i], ref, 1e-5f)) return false;
+			// And within Q8_0 error of the original value.
+			if (std::fabs(y[i] - src[gi] * scale) > 0.05f) return false;
+		}
+		return true;
+	}
+
+	bool test_nnc_embed_row_q4_s()
+	{
+		constexpr size_t n_embd = 64;
+		constexpr size_t n_vocab = 7;
+		std::vector<float> src(n_vocab * n_embd);
+		std::mt19937 rng(0x0400);
+		std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+		for (auto& v : src) v = d(rng);
+
+		constexpr size_t nblocks = n_embd / 32;
+		std::vector<uint8_t> qs(n_vocab * n_embd / 2);
+		std::vector<uint16_t> scales(n_vocab * nblocks), biases(n_vocab * nblocks);
+		for (size_t r = 0; r < n_vocab; ++r)
+			nnc_quantize_f32_to_q4_s(src.data() + r * n_embd,
+			                         qs.data() + r * (n_embd / 2),
+			                         scales.data() + r * nblocks,
+			                         biases.data() + r * nblocks, n_embd);
+
+		constexpr int tok = 5;
+		constexpr float scale = 0.75f;
+		std::vector<float> y(n_embd);
+		nnc_embed_row_q4_s(y.data(), qs.data(), scales.data(), biases.data(),
+		                   tok, n_embd, scale);
+
+		for (size_t b = 0; b < nblocks; ++b)
+		{
+			const uint8_t* blk = qs.data() + tok * (n_embd / 2) + b * 16;
+			const float sc = nnc_bf16_to_f32(scales[tok * nblocks + b]);
+			const float bi = nnc_bf16_to_f32(biases[tok * nblocks + b]);
+			for (size_t k = 0; k < 16; ++k)
+			{
+				if (!close(y[b * 32 + k], (sc * (blk[k] & 0x0F) + bi) * scale, 1e-5f))
+					return false;
+				if (!close(y[b * 32 + k + 16], (sc * (blk[k] >> 4) + bi) * scale, 1e-5f))
+					return false;
+			}
+		}
+		// 4-bit over a [-2,2] spread: max error is half a step ~ 0.13.
+		for (size_t i = 0; i < n_embd; ++i)
+			if (std::fabs(y[i] - src[tok * n_embd + i] * scale) > 0.2f) return false;
+		return true;
+	}
 }
 
 int run_tests()
@@ -1077,17 +1227,19 @@ int run_tests()
 	report("jit_gemv_f32", test_jit_gemv_f32());
 	report("jit_gemv_cache_reuse", test_jit_gemv_cache_reuse());
 	report("nnc_gelu_f32", test_nnc_gelu_f32());
-	report("nnc_dot_f16_to_f32", test_nnc_dot_f16_to_f32());
 	report("nnc_softmax_f32", test_nnc_softmax_f32());
 	report("nnc_layernorm_f32", test_nnc_layernorm_f32());
 	report("nnc_rmsnorm_f32", test_nnc_rmsnorm_f32());
-	report("nnc_gemv_f16w_f32x", test_nnc_gemv_f16w_f32x());
 	report("bf16_round_trip", test_bf16_round_trip());
 	report("bf16_to_f32_row", test_bf16_to_f32_row());
 	report("nnc_gemv_bf16w_f32x", test_nnc_gemv_bf16w_f32x());
 	report("nnc_gemv_bf16w_argmax_f32x", test_nnc_gemv_bf16w_argmax_f32x());
 	report("nnc_q8_0_quantize_roundtrip", test_nnc_q8_0_quantize_roundtrip());
 	report("nnc_gemv_q8_0_f32x", test_nnc_gemv_q8_0_f32x());
+	report("nnc_q4_s_quantize_roundtrip", test_nnc_q4_s_quantize_roundtrip());
+	report("nnc_block_sums_f32", test_nnc_block_sums_f32());
+	report("nnc_gemv_q4_s_f32x", test_nnc_gemv_q4_s_f32x());
+	report("nnc_dequantize_q8_0", test_nnc_dequantize_q8_0());
 	report("nnc_dequantize_q4_k", test_nnc_dequantize_q4_k());
 	report("nnc_dequantize_q5_k", test_nnc_dequantize_q5_k());
 	report("fp16_subnormal_dequant", test_fp16_subnormal_dequant());
@@ -1096,6 +1248,8 @@ int run_tests()
 	report("nnc_rope_f32", test_nnc_rope_f32());
 	report("nnc_softcap_f32", test_nnc_softcap_f32());
 	report("nnc_embed_row_bf16", test_nnc_embed_row_bf16());
+	report("nnc_embed_row_q8_0", test_nnc_embed_row_q8_0());
+	report("nnc_embed_row_q4_s", test_nnc_embed_row_q4_s());
 
 	std::printf("nnc: %d passed, %d failed\n", g_pass, g_fail);
 	return g_fail;

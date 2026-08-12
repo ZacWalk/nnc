@@ -85,6 +85,17 @@ struct gemma_model
 	int reserved = 0;
 };
 
+// Target in-memory layout for weight matrices. Q8_0 is the default:
+// best accuracy per byte of the three. Q4 halves the bytes again at a
+// real (but usually acceptable) accuracy cost; BF16 keeps the source
+// values untouched.
+enum gemma_weight_fmt
+{
+	GEMMA_W_BF16 = 0,
+	GEMMA_W_Q8_0,
+	GEMMA_W_Q4,
+};
+
 struct gemma_file
 {
 	gguf_file gguf; // owns the mmap
@@ -124,33 +135,42 @@ struct gemma_file
 	// which live in the gguf mmap). Sized to fit ~601 tensor headers.
 	nnc_context* ctx = nullptr;
 
-	// Owned Q8_0 buffers (one per quantized tensor). When a weight is
-	// quantized in-place, its `tensor->data` is repointed at one of
-	// these allocations and `tensor->type` becomes NNC_TYPE_Q8_0. Layout:
-	// int8 qs[rows*cols] followed by float scales[rows*cols/32].
+	// Owned quantized buffers (one per converted tensor). `tensor->data`
+	// is repointed at one of these and `tensor->type` becomes
+	// NNC_TYPE_Q8_0 or NNC_TYPE_Q4_S.
 	std::vector<std::unique_ptr<uint8_t[]>> q8_buffers;
 
-	// Owned dequant buffers for K-quant (Q4_K/Q5_K/Q6_K) weights read
-	// straight from disk. Each entry is a BF16 row-major weight image
-	// produced at load time by nnc_dequantize_kquant_to_f32 + f32->bf16.
-	// `tensor->data` for those tensors points into one of these. After
-	// gemma_load returns, the K-quant bytes in the GGUF mmap are no
+	// Owned BF16 buffers for quantized weights that could not go
+	// straight to Q8_0 (quantization disabled, or a shape the Q8_0
+	// layout can't express). `tensor->data` points into one of these;
+	// after gemma_load returns, the packed bytes in the GGUF mmap are no
 	// longer referenced by any tensor.
 	std::vector<std::unique_ptr<uint8_t[]>> dequant_buffers;
+
+	// Set before tensor construction: the layout packed source tensors
+	// are decoded straight into, so no intermediate BF16 image is ever
+	// materialised.
+	gemma_weight_fmt want_fmt = GEMMA_W_BF16;
+
+	// Total bytes of loader-owned weight storage. Weights used in place
+	// from the mmap are not counted.
+	size_t decoded_bytes = 0;
 };
 
-// Convert eligible BF16 weight tensors in `f` to the Q8_0 split layout.
-// Targets: per-layer Q/K/V/O, FFN gate/up/down, and the top-level
-// token_embd (which doubles as the lm_head). Only tensors whose
-// fast-dim (`cols = ne[0]`) is a positive multiple of 32 are converted;
-// anything else is left as BF16. Allocates ~half the model size of new
-// RAM (the mmapped BF16 bytes stay mapped until OS paging reclaims
-// them; we do not unmap them).
+// Convert eligible BF16 weight tensors in `f` to `fmt`. Targets the
+// per-layer Q/K/V/O and FFN matrices, the PLE projections, the embedding
+// tables, and a separate `output` lm_head. Only tensors whose fast dim
+// (`cols = ne[0]`) is a positive multiple of 32 are converted; anything
+// else is left as BF16. Tensors that were packed on disk have already
+// been handled at load time, so this pass is a no-op for them.
 //
 // Returns true on success, false if any allocation fails.
-bool gemma_quantize_q8_0(gemma_file& f);
+bool gemma_quantize_weights(gemma_file& f, gemma_weight_fmt fmt);
 
-bool gemma_load(const std::string& path, gemma_file& out);
+// Load a Gemma/llama GGUF. Packed weights are decoded directly into
+// `fmt`; BF16 weights are converted in a post-pass.
+bool gemma_load(const std::string& path, gemma_file& out,
+                gemma_weight_fmt fmt = GEMMA_W_BF16);
 void gemma_free(gemma_file& f);
 
 // Pretty-print parsed hparams, vocab summary, and which expected
@@ -201,10 +221,33 @@ struct gemma_kv_cache
 	std::vector<float> sple_contrib; // [n_embd]
 	std::vector<float> sple_inputs; // [ple_dim * n_layer]
 	std::vector<float> sple_proj; // [ple_dim * n_layer]
+	std::vector<float> sxsum; // [max_cols/32]  Q4 per-block sums of x
+
+	// Maximum tokens per gemma_eval_tokens call; every scratch vector
+	// above is sized n_batch times its per-token extent.
+	int n_batch = 1;
 };
 
-bool gemma_kv_init(const gemma_file& f, gemma_kv_cache& cache, int n_ctx);
+// Tokens per prefill batch. Large enough to amortise a weight pass over
+// many tokens, small enough that the batch's activations stay in L2.
+constexpr int GEMMA_PREFILL_BATCH = 16;
+
+// `n_batch` is the widest prefill chunk the cache will be asked to
+// handle. Decode always uses 1; prefill batches amortise one pass over
+// the weights across n_batch tokens, which is the whole point.
+bool gemma_kv_init(const gemma_file& f, gemma_kv_cache& cache, int n_ctx,
+                   int n_batch = 1);
 void gemma_kv_free(gemma_kv_cache& cache);
+
+// Evaluate `n_tok` consecutive tokens starting at `pos0` (which must
+// equal cache.cur_pos). Appends K/V for all of them and returns the
+// logits (or argmax) of the LAST token only — the others' predictions
+// are not needed by a causal decoder. n_tok must be <= cache.n_batch.
+int gemma_eval_tokens(const gemma_file& f, gemma_kv_cache& cache,
+                      const int* tokens, int n_tok, int pos0, float* logits);
+int gemma_eval_tokens_argmax(const gemma_file& f, gemma_kv_cache& cache,
+                             const int* tokens, int n_tok, int pos0,
+                             int* out_argmax);
 
 // Evaluate one token at `pos` (must equal cache.cur_pos). Appends K/V
 // to the cache, computes attention against all cached positions in the

@@ -122,6 +122,11 @@ bool gpt_params_parse(const int argc, char** argv, gpt_params& params)
 			if (!v) return false;
 			params.model = v;
 		}
+		else if (arg == "--bf16" || arg == "-bf16" || arg == "--q8" || arg == "-q8"
+			|| arg == "--q4" || arg == "-q4" || arg == "--perf" || arg == "-perf")
+		{
+			// Global flags; already consumed by main.cpp's pre-scan.
+		}
 		else if (arg == "-h" || arg == "--help")
 		{
 			gpt_print_usage(argc, argv, params);
@@ -145,6 +150,10 @@ void gpt_print_usage(int argc, char** argv, const gpt_params& params)
 	fprintf(stderr, "options:\n");
 	fprintf(stderr, "  -h, --help            show this help message and exit\n");
 	fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1)\n");
+	fprintf(stderr, "  --bf16                keep weights as BF16 (default: quantize to Q8_0)\n");
+	fprintf(stderr, "  --q8                  quantize weights to Q8_0 (default)\n");
+	fprintf(stderr, "  --q4                  quantize weights to 4-bit (half the bytes of Q8_0)\n");
+	fprintf(stderr, "  --perf                print a per-phase timing breakdown after each reply\n");
 	fprintf(stderr, "  -p PROMPT, --prompt PROMPT\n");
 	fprintf(stderr, "                        prompt to start generation with (default: random)\n");
 	fprintf(stderr, "  -n N, --n_predict N   number of tokens to predict (default: %d)\n", params.n_predict);

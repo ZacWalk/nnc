@@ -1,7 +1,7 @@
-// nnc — AVX2 + FMA + F16C encoder implementation.
+// nnc — AVX2 + FMA encoder implementation.
 // VEX 2-byte / 3-byte prefix construction plus the specific vector
 // instructions used by the JIT kernels (loads, fmadd, broadcast,
-// vcvtph2ps, horizontal helpers, ...).
+// vpmovzxwd / vpmovsxbd widening, horizontal helpers, ...).
 
 #include "emitter_avx2.h"
 #include "jit_buffer.h"
@@ -120,6 +120,44 @@ void avx2_emitter::vfmadd231ps_ymm_mem_basex4_disp8(ymm acc, ymm a, gpr base, gp
 	buf_.emit_u8(static_cast<uint8_t>(disp));
 }
 
+// ----- VEX.DDS.256.66.0F38.W0 B8 /r : VFMADD231PS ymm, ymm, [base+ix*8] -
+void avx2_emitter::vfmadd231ps_ymm_mem_basex8(ymm acc, ymm a, gpr base, gpr index)
+{
+	const uint8_t d = static_cast<uint8_t>(acc);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && s1 < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+	assert((bs & 7) != 5);
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     vex_inv_vvvv(s1), 1, 0b01);
+	buf_.emit_u8(0xB8);
+	buf_.emit_u8(modrm(0b00, d, 0b100));
+	buf_.emit_u8(sib(0b11, ix, bs));
+}
+
+// ----- VEX.DDS.256.66.0F38.W0 B8 /r : VFMADD231PS ymm, ymm, [base+ix*8+d8]
+void avx2_emitter::vfmadd231ps_ymm_mem_basex8_disp8(ymm acc, ymm a, gpr base, gpr index, const int8_t disp)
+{
+	const uint8_t d = static_cast<uint8_t>(acc);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && s1 < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     vex_inv_vvvv(s1), 1, 0b01);
+	buf_.emit_u8(0xB8);
+	buf_.emit_u8(modrm(0b01, d, 0b100));
+	buf_.emit_u8(sib(0b11, ix, bs));
+	buf_.emit_u8(static_cast<uint8_t>(disp));
+}
+
 // ----- VEX.DDS.256.66.0F38.W0 B8 /r : VFMADD231PS ymm, ymm, ymm ---------
 void avx2_emitter::vfmadd231ps_ymm_ymm_ymm(ymm acc, ymm a, ymm b)
 {
@@ -133,60 +171,6 @@ void avx2_emitter::vfmadd231ps_ymm_ymm_ymm(ymm acc, ymm a, ymm b)
 	     vex_inv_vvvv(s1), 1, 0b01);
 	buf_.emit_u8(0xB8);
 	buf_.emit_u8(modrm(0b11, d, s2));
-}
-
-// ----- VEX.256.66.0F38.W0 13 /r : VCVTPH2PS ymm, m128 -------------------
-void avx2_emitter::vcvtph2ps_ymm_load_base_disp32(ymm dst, gpr base, const int32_t disp)
-{
-	const uint8_t d = static_cast<uint8_t>(dst);
-	const uint8_t bs = static_cast<uint8_t>(base);
-	assert(d < 8 && bs < 8);
-	assert((bs & 7) != 4 && "base = RSP/R12 needs SIB; not implemented");
-
-	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
-	     0b00010, 0,
-	     0xF, 1, 0b01);
-	buf_.emit_u8(0x13);
-	// mod=10 disp32 form: works for any low-8 base except rsp (needs SIB)
-	// and is also fine for rbp (mod=00 would be RIP-relative, not what we want).
-	buf_.emit_u8(modrm(0b10, d, bs));
-	buf_.emit_u32(static_cast<uint32_t>(disp));
-}
-
-// ----- VEX.256.66.0F38.W0 13 /r : VCVTPH2PS ymm, m128 (SIB index*2) ------
-void avx2_emitter::vcvtph2ps_ymm_load_basex2(ymm dst, gpr base, gpr index)
-{
-	const uint8_t d = static_cast<uint8_t>(dst);
-	const uint8_t bs = static_cast<uint8_t>(base);
-	const uint8_t ix = static_cast<uint8_t>(index);
-	assert(d < 8 && bs < 8 && ix < 8);
-	assert(ix != static_cast<uint8_t>(gpr::rsp));
-	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8 form; not implemented");
-
-	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
-	     0b00010, 0,
-	     0xF, 1, 0b01);
-	buf_.emit_u8(0x13);
-	buf_.emit_u8(modrm(0b00, d, 0b100)); // SIB follows
-	buf_.emit_u8(sib(0b01, ix, bs)); // scale=*2
-}
-
-// ----- VCVTPH2PS ymm, [base + index*2 + disp8] --------------------------
-void avx2_emitter::vcvtph2ps_ymm_load_basex2_disp8(ymm dst, gpr base, gpr index, const int8_t disp)
-{
-	const uint8_t d = static_cast<uint8_t>(dst);
-	const uint8_t bs = static_cast<uint8_t>(base);
-	const uint8_t ix = static_cast<uint8_t>(index);
-	assert(d < 8 && bs < 8 && ix < 8);
-	assert(ix != static_cast<uint8_t>(gpr::rsp));
-
-	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
-	     0b00010, 0,
-	     0xF, 1, 0b01);
-	buf_.emit_u8(0x13);
-	buf_.emit_u8(modrm(0b01, d, 0b100));
-	buf_.emit_u8(sib(0b01, ix, bs));
-	buf_.emit_u8(static_cast<uint8_t>(disp));
 }
 
 // ----- VEX.256.66.0F38.W0 33 /r : VPMOVZXWD ymm, m128 (SIB index*2) -----
@@ -280,6 +264,115 @@ void avx2_emitter::vpmovsxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index,
 	buf_.emit_u8(static_cast<uint8_t>(disp));
 }
 
+// ----- VEX.256.66.0F38.W0 31 /r : VPMOVZXBD ymm, m64 (SIB index*1) -------
+// 8 packed unsigned bytes in [base + index] -> 8 zero-extended dwords.
+void avx2_emitter::vpmovzxbd_ymm_load_basex1(ymm dst, gpr base, gpr index)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8 form; not implemented");
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x31);
+	buf_.emit_u8(modrm(0b00, d, 0b100));
+	buf_.emit_u8(sib(0b00, ix, bs));
+}
+
+// ----- VPMOVZXBD ymm, [base + index + disp8] -----------------------------
+void avx2_emitter::vpmovzxbd_ymm_load_basex1_disp8(ymm dst, gpr base, gpr index, const int8_t disp)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x31);
+	buf_.emit_u8(modrm(0b01, d, 0b100));
+	buf_.emit_u8(sib(0b00, ix, bs));
+	buf_.emit_u8(static_cast<uint8_t>(disp));
+}
+
+// ----- VMOVUPS ymm, [base + index*8] ------------------------------------
+void avx2_emitter::vmovups_ymm_load_basex8(ymm dst, gpr base, gpr index)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8 form; not implemented");
+
+	vex2(vex_inv_high(d), 0xF, 1, 0);
+	buf_.emit_u8(0x10);
+	buf_.emit_u8(modrm(0b00, d, 0b100));
+	buf_.emit_u8(sib(0b11, ix, bs));
+}
+
+// ----- VMOVUPS ymm, [base + index*8 + disp8] ----------------------------
+void avx2_emitter::vmovups_ymm_load_basex8_disp8(ymm dst, gpr base, gpr index, const int8_t disp)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	const uint8_t ix = static_cast<uint8_t>(index);
+	assert(d < 8 && bs < 8 && ix < 8);
+	assert(ix != static_cast<uint8_t>(gpr::rsp));
+
+	vex2(vex_inv_high(d), 0xF, 1, 0);
+	buf_.emit_u8(0x10);
+	buf_.emit_u8(modrm(0b01, d, 0b100));
+	buf_.emit_u8(sib(0b11, ix, bs));
+	buf_.emit_u8(static_cast<uint8_t>(disp));
+}
+
+// ----- VEX.NDS.256.66.0F.WIG DB /r : VPAND ymm, ymm, ymm ----------------
+void avx2_emitter::vpand_ymm(ymm dst, ymm a, ymm b)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t s2 = static_cast<uint8_t>(b);
+	assert(d < 8 && s1 < 8 && s2 < 8);
+
+	vex2(vex_inv_high(d), vex_inv_vvvv(s1), 1, 0b01);
+	buf_.emit_u8(0xDB);
+	buf_.emit_u8(modrm(0b11, d, s2));
+}
+
+// ----- VEX.NDS.256.66.0F.WIG 76 /r : VPCMPEQD ymm, ymm, ymm -------------
+void avx2_emitter::vpcmpeqd_ymm(ymm dst, ymm a, ymm b)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t s1 = static_cast<uint8_t>(a);
+	const uint8_t s2 = static_cast<uint8_t>(b);
+	assert(d < 8 && s1 < 8 && s2 < 8);
+
+	vex2(vex_inv_high(d), vex_inv_vvvv(s1), 1, 0b01);
+	buf_.emit_u8(0x76);
+	buf_.emit_u8(modrm(0b11, d, s2));
+}
+
+// ----- VEX.NDS.256.66.0F.WIG 72 /2 ib : VPSRLD ymm, ymm, imm8 ----------
+// dst encoded in vvvv, src in modrm.rm, /2 in modrm.reg.
+void avx2_emitter::vpsrld_ymm_imm8(ymm dst, ymm src, const uint8_t imm)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t s = static_cast<uint8_t>(src);
+	assert(d < 8 && s < 8);
+
+	vex2(1, vex_inv_vvvv(d), 1, 0b01);
+	buf_.emit_u8(0x72);
+	buf_.emit_u8(modrm(0b11, 2, s));
+	buf_.emit_u8(imm);
+}
+
 // ----- VEX.256.66.0F38.W0 18 /r : VBROADCASTSS ymm, m32 -----------------
 // Loads one f32 from [base] and broadcasts to all 8 lanes.
 void avx2_emitter::vbroadcastss_ymm_load_base(ymm dst, gpr base)
@@ -294,6 +387,25 @@ void avx2_emitter::vbroadcastss_ymm_load_base(ymm dst, gpr base)
 	     0b00010, 0,
 	     0xF, 1, 0b01);
 	buf_.emit_u8(0x18);
+	buf_.emit_u8(modrm(0b00, d, bs));
+}
+
+// ----- VEX.256.66.0F38.W0 79 /r : VPBROADCASTW ymm, m16 ----------------
+// Broadcasts one 16-bit word to all 16 lanes. With a following
+// `vpslld ymm, ymm, 16` this lands a bf16 value in the high half of every
+// dword, i.e. broadcasts it as f32.
+void avx2_emitter::vpbroadcastw_ymm_load_base(ymm dst, gpr base)
+{
+	const uint8_t d = static_cast<uint8_t>(dst);
+	const uint8_t bs = static_cast<uint8_t>(base);
+	assert(d < 8 && bs < 8);
+	assert((bs & 7) != 4 && "base = RSP/R12 needs SIB; not implemented");
+	assert((bs & 7) != 5 && "base = RBP/R13 needs disp8; not implemented");
+
+	vex3(vex_inv_high(d), 1, vex_inv_high(bs),
+	     0b00010, 0,
+	     0xF, 1, 0b01);
+	buf_.emit_u8(0x79);
 	buf_.emit_u8(modrm(0b00, d, bs));
 }
 

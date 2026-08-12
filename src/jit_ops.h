@@ -20,22 +20,6 @@ void nnc_build_dot_f32(jit_buffer& buf);
 // all data pointers in low-8 GPRs.
 void nnc_build_gemv_f32(jit_buffer& buf, uint32_t rows, uint32_t cols);
 
-// Emits  float dot_f16_to_f32(const fp16* x, const fp16* y);
-// rcx=x, rdx=y, return in xmm0. n is baked. Requires n > 0 and n % 32 == 0.
-// Fully unrolled. Uses F16C vcvtph2ps to expand 8 halves -> 8 floats and
-// FMA into 4 ymm accumulators (sum0..sum3) for better ILP.
-void nnc_build_dot_f16_to_f32(jit_buffer& buf, uint32_t n);
-
-// Emits  void gemv_f16w_f32x(const fp16* W, const float* x, float* y);
-// rcx=W, rdx=x, r8=y. rows and cols are baked into the emitted code as
-// 32-bit immediates. cols must be a positive multiple of 8.
-//
-// Layout: y[r] = sum_{k=0..cols-1} fp16_to_fp32(W[r*cols + k]) * x[k].
-//
-// per-row vec_dot_f16 and skips its FP32->FP16 packing of x
-// entirely. Saves rsi+rdi in prologue (Win64 nonvolatile).
-void nnc_build_gemv_f16w_f32x(jit_buffer& buf, uint32_t rows, uint32_t cols);
-
 // Emits  void gemv_bf16w_f32x(const bf16* W, const float* x, float* y);
 // rcx=W, rdx=x, r8=y. rows and cols are baked into the emitted code as
 // 32-bit immediates. cols must be a positive multiple of 8.
@@ -69,3 +53,23 @@ void nnc_build_gemv_bf16w_f32x_4row(jit_buffer& buf, uint32_t rows, uint32_t col
 //
 // Win64 ABI: rcx=qs, rdx=x, r8=y_out, r9=scales. Saves rsi+rdi.
 void nnc_build_gemv_q8_0_f32x_1row(jit_buffer& buf, uint32_t cols);
+
+// Emits a single-row Q4 (nnc split 4-bit) dot-product kernel:
+//   void gemv_q4_s_1row(const uint8_t* qs, const float* x,
+//                       float* y_out, const float* scales);
+// Computes  *y_out = sum_b scales[b] * sum_{k in block b} q[b*32+k] * x[b*32+k]
+// where q is the unsigned 4-bit quant in [0, 15]. The per-block bias term
+// (`sum_b bias[b] * sum_{k in b} x[k]`) is NOT computed here — the caller
+// adds it, because it factors into a plain f32 dot product of the row's
+// biases against a per-call prefix sum of x that is shared by every row.
+//
+// Nibble order within a 32-element block matches the quantizer: byte i of
+// the 16-byte block holds element i in its low nibble and element i+16 in
+// its high nibble, so one vpmovzxbd + vpand/vpsrld pair yields two
+// 8-element groups.
+//
+// cols must be a positive multiple of 32. The caller iterates rows
+// externally, advancing qs by `cols/2` bytes and scales by `(cols/32)*4`.
+//
+// Win64 ABI: rcx=qs, rdx=x, r8=y_out, r9=scales. Saves rsi+rdi.
+void nnc_build_gemv_q4_s_f32x_1row(jit_buffer& buf, uint32_t cols);

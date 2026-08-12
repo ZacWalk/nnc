@@ -75,10 +75,9 @@ struct jit_kernel_cache::impl
 
 	// Key packs (rows, cols) into a single 64-bit value.
 	std::unordered_map<uint64_t, entry> gemv_;
-	std::unordered_map<uint32_t, entry> dot_f16_;
-	std::unordered_map<uint64_t, entry> gemv_f16w_f32x_;
 	std::unordered_map<uint64_t, entry> gemv_bf16w_f32x_;
 	std::unordered_map<uint32_t, entry> gemv_q8_0_1row_;
+	std::unordered_map<uint32_t, entry> gemv_q4_s_1row_;
 	// shared_mutex: hot-path lookups take a shared lock (concurrent
 	// readers OK), and only first-time codegen takes the exclusive lock.
 	// After first-token warmup every gemv hits the shared path. The maps
@@ -138,26 +137,8 @@ nnc_gemv_f32_fn jit_kernel_cache::get_gemv_f32(const uint32_t rows, const uint32
 size_t jit_kernel_cache::size() const
 {
 	std::shared_lock<std::shared_mutex> lk(p_->mu_);
-	return p_->gemv_.size() + p_->dot_f16_.size() + p_->gemv_f16w_f32x_.size()
-		+ p_->gemv_bf16w_f32x_.size() + p_->gemv_q8_0_1row_.size();
-}
-
-nnc_dot_f16_fn jit_kernel_cache::get_dot_f16(const uint32_t n)
-{
-	assert(n > 0 && (n % 32) == 0);
-	return reinterpret_cast<nnc_dot_f16_fn>(
-		lookup_or_build(p_->mu_, p_->dot_f16_, n,
-		                [&](jit_buffer& b) { nnc_build_dot_f16_to_f32(b, n); }));
-}
-
-nnc_gemv_f16w_f32x_fn jit_kernel_cache::get_gemv_f16w_f32x(const uint32_t rows, const uint32_t cols)
-{
-	assert(rows > 0);
-	assert(cols > 0 && (cols % 8) == 0);
-	const uint64_t key = pack(rows, cols);
-	return reinterpret_cast<nnc_gemv_f16w_f32x_fn>(
-		lookup_or_build(p_->mu_, p_->gemv_f16w_f32x_, key,
-		                [&](jit_buffer& b) { nnc_build_gemv_f16w_f32x(b, rows, cols); }));
+	return p_->gemv_.size() + p_->gemv_bf16w_f32x_.size()
+		+ p_->gemv_q8_0_1row_.size() + p_->gemv_q4_s_1row_.size();
 }
 
 nnc_gemv_bf16w_f32x_fn jit_kernel_cache::get_gemv_bf16w_f32x(const uint32_t rows, const uint32_t cols)
@@ -186,4 +167,12 @@ nnc_gemv_q8_0_1row_fn jit_kernel_cache::get_gemv_q8_0_1row(const uint32_t cols)
 	return reinterpret_cast<nnc_gemv_q8_0_1row_fn>(
 		lookup_or_build(p_->mu_, p_->gemv_q8_0_1row_, cols,
 		                [&](jit_buffer& b) { nnc_build_gemv_q8_0_f32x_1row(b, cols); }));
+}
+
+nnc_gemv_q4_s_1row_fn jit_kernel_cache::get_gemv_q4_s_1row(const uint32_t cols)
+{
+	assert(cols > 0 && (cols % 32) == 0);
+	return reinterpret_cast<nnc_gemv_q4_s_1row_fn>(
+		lookup_or_build(p_->mu_, p_->gemv_q4_s_1row_, cols,
+		                [&](jit_buffer& b) { nnc_build_gemv_q4_s_f32x_1row(b, cols); }));
 }
