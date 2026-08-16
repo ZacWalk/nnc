@@ -1,0 +1,41 @@
+name: Windows
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build & test (MSVC, Ninja)
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
+          ninja --version
+          cmake --version
+
+      # vcvars64.bat only affects the process that calls it, so configure,
+      # build and test all run inside this single cmd step.
+      - name: Configure, build & test
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          cl 2>&1 | findstr /C:"Version"
+          cmake --preset release || exit /b 1
+          cmake --build --preset release || exit /b 1
+          cmake --preset debug || exit /b 1
+          cmake --build --preset debug || exit /b 1
+          exe\nnc-d.exe --test || exit /b 1

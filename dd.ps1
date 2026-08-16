@@ -100,25 +100,56 @@ if (-not (Test-Path -LiteralPath $vswhere))
 	throw "vswhere.exe not found at $vswhere"
 }
 
-$msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
-if (-not $msbuild)
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+if (-not $vsPath)
 {
-	throw 'MSBuild not found via vswhere.'
+	throw 'No Visual Studio installation with the C++ toolset was found.'
+}
+
+# Ninja invokes cl.exe directly, so the MSVC x64 environment has to be in this
+# process before CMake configures.
+if (-not (Get-Command cl -ErrorAction SilentlyContinue))
+{
+	Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+	Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+	Set-Location -LiteralPath $PSScriptRoot
+}
+
+# Fall back to the cmake/ninja shipped with Visual Studio if they aren't on PATH.
+foreach ($tool in @(@{ Name = 'cmake'; Dir = 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin' },
+		@{ Name = 'ninja'; Dir = 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja' }))
+{
+	if (Get-Command $tool.Name -ErrorAction SilentlyContinue) { continue }
+	$dir = Join-Path $vsPath $tool.Dir
+	if (Test-Path -LiteralPath (Join-Path $dir "$($tool.Name).exe"))
+	{
+		$env:PATH = "$dir;$env:PATH"
+	}
+	else
+	{
+		throw "$($tool.Name) not found on PATH or under $vsPath."
+	}
+}
+
+function Invoke-Build([string]$Preset)
+{
+	& cmake --preset $Preset
+	if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+	& cmake --build --preset $Preset
+	if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 switch ($Action)
 {
 	'run'
 	{
-		& $msbuild nnc.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
-		if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+		Invoke-Build 'release'
 		& .\exe\nnc.exe @Rest
 		exit $LASTEXITCODE
 	}
 	'test'
 	{
-		& $msbuild nnc.sln /p:Configuration=Debug /p:Platform=x64 /m /v:minimal /nologo
-		if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+		Invoke-Build 'debug'
 		& .\exe\nnc-d.exe --test @Rest
 		exit $LASTEXITCODE
 	}

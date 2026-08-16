@@ -1,0 +1,50 @@
+name: Linux
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build & test (g++, Ninja)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image usually ships Ninja; only reach for apt if it doesn't.
+      - name: Ensure Ninja
+        run: |
+          if ! command -v ninja >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build
+          fi
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ninja --version
+          g++ --version
+
+      - name: Configure (Release)
+        run: cmake --preset release
+
+      - name: Build (Release)
+        run: cmake --build --preset release
+
+      - name: Configure (Debug)
+        run: cmake --preset debug
+
+      - name: Build (Debug)
+        run: cmake --build --preset debug
+
+      - name: Test
+        run: ./exe/nnc-d --test

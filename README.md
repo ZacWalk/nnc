@@ -1,5 +1,8 @@
 # nnc — Neural Net Compiler
 
+[![Linux](https://github.com/ZacWalk/nnc/actions/workflows/linux.yml/badge.svg)](https://github.com/ZacWalk/nnc/actions/workflows/linux.yml)
+[![Windows](https://github.com/ZacWalk/nnc/actions/workflows/windows.yml/badge.svg)](https://github.com/ZacWalk/nnc/actions/workflows/windows.yml)
+
 I have always been fascinated by all the memory shuffling that happens to run a model on a GPU. What happens if you just run it on the CPU optimized for SIMD instructions. This is my learning project that JIT-compiles the hot operations of a transformer into machine code tuned for the host CPU, then uses it to run **Gemma inference end-to-end** on its own minimal tensor runtime.
 
 ![nnc prompt demo](ncc-prompt.gif)
@@ -55,9 +58,10 @@ The loader accepts `gemma4` (Gemma 3n), `gemma3` and `llama` architectures.
 
 - x86-64 CPU with **AVX2 + FMA** (detected at startup; older CPUs are refused).
   AVX-512 is intentionally not used.
+- **CMake 3.21+** and **Ninja**.
 - One of:
-  - **Windows x64** with MSVC v145+ (Visual Studio 2022).
-  - **Linux x64** (or WSL2) with `g++` 10+ or `clang++` 12+ and `make`.
+  - **Windows x64** with MSVC v143+ (Visual Studio 2022 or later).
+  - **Linux x64** (or WSL2) with `g++` 10+ or `clang++` 12+.
 - C++20 / C17.
 
 ## Getting a model
@@ -81,28 +85,39 @@ that do not load and why.
 
 ## Build
 
-### Windows (MSVC, x64)
+One CMake + Ninja build serves both platforms. Two presets, `release` and
+`debug`; both drop their binary in `exe/`.
 
-```powershell
-$msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-    -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe
-& $msbuild nnc.sln /p:Configuration=Debug /p:Platform=x64 /m /v:minimal /nologo
+```bash
+cmake --preset release && cmake --build --preset release   # -> exe/nnc[.exe]
+cmake --preset debug   && cmake --build --preset debug     # -> exe/nnc-d[.exe]
+ctest --preset debug                                       # runs --test
 ```
 
-Output: `exe\nnc-d.exe` (Debug) or `exe\nnc.exe` (Release).
+Build trees live in `build/<HostSystem>-<preset>/`, so a Windows and a WSL
+build of the same working tree do not fight over one cache.
+
+### Windows (MSVC, x64)
+
+Ninja invokes `cl.exe` directly, so run the commands from a **x64 Native
+Tools Command Prompt** / VS Developer PowerShell. Or just use the dev
+driver, which sets the environment up for you:
+
+```powershell
+.\dd.ps1 run       # configure + build Release, then run exe\nnc.exe
+.\dd.ps1 test      # configure + build Debug, then run exe\nnc-d.exe --test
+```
 
 ### Linux / WSL (g++ or clang++, x86-64 with AVX2 + FMA + F16C)
 
 ```bash
-make            # release  -> exe/nnc
-make debug      # debug    -> exe/nnc-d
-make test       # debug build + run --test
-make clean
+sudo apt-get install -y cmake ninja-build g++
+cmake --preset release && cmake --build --preset release
 ```
 
 All OS-specific calls live behind `src/sys.h`; `src/sys_win.cpp` is built
 on Windows and `src/sys_linux.cpp` is built on Linux. Each TU is
-`#if`-guarded so both files can sit in the project on either platform.
+`#if`-guarded so both files can sit in the build on either platform.
 The JIT kernels are written assuming the Windows x64 calling convention;
 on Linux every kernel prepends a tiny SysV→Win64 register shuffle so the
 same encoders are used unchanged.
@@ -156,7 +171,10 @@ Environment:
 
 ## Repository layout
 
-Flat by design — everything lives directly under `src/`.
+Flat by design — everything lives directly under `src/`. At the top level:
+`CMakeLists.txt` + `CMakePresets.json` (the build), `dd.ps1` (Windows dev
+driver), `.github/workflows/` (CI), `docs/` (design notes and per-model
+measurements).
 
 | File | Purpose |
 | --- | --- |

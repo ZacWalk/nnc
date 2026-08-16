@@ -11,7 +11,7 @@ link to it rather than restating it.
 
 - **Name:** `nnc` (neural net compiler). Use this name in all new docs, comments, log prefixes, CLI help text, and identifiers.
 - **Executable:** one binary, `nnc.exe` (Debug: `nnc-d.exe`) on Windows; `nnc` / `nnc-d` on Linux. No second exe for tests, no second exe for tooling.
-- **Platforms:** Windows x64 (MSVC v145+) and Linux x64 (g++ 10+ / clang++ 12+, including WSL2). C++20, C17.
+- **Platforms:** Windows x64 (MSVC v143+) and Linux x64 (g++ 10+ / clang++ 12+, including WSL2). C++20, C17. Build system is CMake + Ninja on both.
 - **CPU baseline:** AVX2 + FMA. Do **not** use AVX-512 intrinsics or codegen. Detect AVX2/FMA at startup; refuse to run on older CPUs.
 - **No new dependencies** without an explicit ask. Must build with only MSVC + the Windows SDK, or g++/clang + libstdc++.
 
@@ -20,13 +20,13 @@ link to it rather than restating it.
 Keep the layout **flat**. Do not create subfolders under `src/` (no `src/jit/`, no `src/ops/`).
 
 ```
-nnc.sln
-Makefile                     Linux build (release/debug/test/clean)
+CMakeLists.txt               the build (Windows + Linux, Ninja)
+CMakePresets.json            `release` / `debug` presets
 dd.ps1                       Windows dev driver: run / test / download
+.github/workflows/           CI: linux.yml, windows.yml
 docs/design.md               how it works — keep this current
 docs/models.md               per-model measured speed / footprint / what won't load
 src/
-  nnc.vcxproj
   main.cpp                   CLI entry, argument dispatch, model picker, REPL
   runtime.cpp / runtime.h    arena allocator, dtype table, tensor descriptors, timers, profiler
   nn_ops.cpp / nn_ops.h      own SIMD kernels + JIT-routed gemv + worker pool + (de)quantizers
@@ -43,6 +43,7 @@ src/
   sys_linux.cpp              Linux/POSIX impl of sys.h (#if !defined(_WIN32))
   tests.cpp                  ALL tests live here (app + jit). Single TU.
 models/                      weight files (.gguf), fetched by `dd.ps1 download`
+build/                       CMake trees, one per host+preset (gitignored)
 exe/                         build output (nnc(.exe), nnc-d(.exe))
 ```
 
@@ -50,6 +51,10 @@ exe/                         build output (nnc(.exe), nnc-d(.exe))
 `<unistd.h>` etc. outside `sys_win.cpp` / `sys_linux.cpp`. New OS
 functionality goes through a new `sys_*` function declared in `sys.h`
 and implemented in both backends.
+
+**New source files must be added to the `NNC_SOURCES` list in
+`CMakeLists.txt`** — the list is explicit, not globbed, so a new `.cpp`
+silently does nothing until it is listed there.
 
 **No computation graph.** `gemma.cpp` calls kernels directly. A graph /
 op-dispatch layer existed once, went unused, and was deleted. Do not
@@ -173,7 +178,19 @@ that removes instructions without removing bytes read will measure as noise.
 
 ## Build & run (reference)
 
-`dd.ps1` is the Windows dev driver:
+One CMake + Ninja build for both platforms. Presets `release` and `debug`;
+both write their binary to `exe/`, and the build trees are kept apart per
+host OS (`build/Windows-release`, `build/Linux-debug`, …) so a Windows and a
+WSL build of the same tree can coexist.
+
+```bash
+cmake --preset release && cmake --build --preset release   # -> exe/nnc[.exe]
+cmake --preset debug   && cmake --build --preset debug     # -> exe/nnc-d[.exe]
+ctest --preset debug                                       # runs --test
+```
+
+`dd.ps1` is the Windows dev driver — it enters the VS x64 environment (Ninja
+calls `cl.exe` directly, so this is required) before invoking CMake:
 
 ```powershell
 .\dd.ps1 run  [args...]     # build Release, run nnc.exe
@@ -182,29 +199,26 @@ that removes instructions without removing bytes read will measure as noise.
 .\dd.ps1 download all       # fetch them into .\models
 ```
 
-### Windows (MSBuild via `vswhere`)
+### Windows (raw CMake)
+
+Run from a **x64 Native Tools Command Prompt** or a VS Developer PowerShell:
 
 ```powershell
-$msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-    -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe
-& $msbuild nnc.sln /p:Configuration=Debug /p:Platform=x64 /m /v:minimal /nologo
-```
-
-Smoke run / tests:
-
-```powershell
-.\exe\nnc-d.exe
+cmake --preset debug
+cmake --build --preset debug
 .\exe\nnc-d.exe --test
 ```
 
 ### Linux / WSL
 
 ```bash
-make debug          # -> exe/nnc-d
-make                # release -> exe/nnc
-make test           # build debug + run --test
+sudo apt-get install -y cmake ninja-build g++
+cmake --preset debug && cmake --build --preset debug
 ./exe/nnc-d --test
 ```
+
+CI (`.github/workflows/linux.yml`, `windows.yml`) builds both presets and
+runs `--test` on every push and PR to `master`. Keep both green.
 
 ## House style
 
